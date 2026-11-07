@@ -15,6 +15,8 @@ pub enum ButError {
     InvalidTransaction(String),
     /// Block galat hai (hash mismatch, prev hash galat, validator galat, ...).
     InvalidBlock(String),
+    /// BFT vote galat hai (signature galat, voter validator nahi hai, quorum nahi, ...).
+    InvalidVote(String),
     /// Chain galat hai (verify fail).
     InvalidChain(String),
     /// Disk storage error.
@@ -33,6 +35,7 @@ impl fmt::Display for ButError {
             ButError::InvalidSignature(m) => write!(f, "galat signature: {m}"),
             ButError::InvalidTransaction(m) => write!(f, "galat transaction: {m}"),
             ButError::InvalidBlock(m) => write!(f, "galat block: {m}"),
+            ButError::InvalidVote(m) => write!(f, "galat vote: {m}"),
             ButError::InvalidChain(m) => write!(f, "galat chain: {m}"),
             ButError::Storage(m) => write!(f, "storage error: {m}"),
             ButError::Network(m) => write!(f, "network error: {m}"),

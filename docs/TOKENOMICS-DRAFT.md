@@ -94,12 +94,15 @@ Genesis block me 1 billion BUT kaise baante jayein:
 > **Team share (FINAL — Sanjay, 2026-11-07):** Jab bhi koi block reward
 > hoga, uska **0.1% team ke account me jayega**. Ye team ki ongoing
 > funding hai — team ka genesis allocation sirf 1% hai, isliye team ko
-> har block reward se chhota hissa milta rahega. Code me abhi block
-> reward hi nahi hai, isliye ye Phase 3 me implement hoga.
+> har block reward se chhota hissa milta rahega. **Code me hai (Phase 3a):**
+> har block par reward mint hota hai, proposer ko 99.9% aur team ko 0.1%
+> milta hai; team account genesis me set hota hai, set na ho to team share
+> `team_accrued` me jama hota hai.
 >
-> Code me abhi block reward NAHI hai — validator ko sirf transaction
-> fees milti hain (jo `chain.rs` me pehle se hai). Block reward Phase 3 me
-> jodega, jab reward formula design ho jayega.
+> Code me abhi block reward hai (Phase 3a) — par **amount PLACEHOLDER hai**
+> (5 BUT/block + ~4 saal me halving, sirf mechanism ke liye). Sanjay ka
+> FINAL demand-based formula aate hi ye badlega. Validator ko fees ke
+> saath-saath block reward bhi milta hai.
 
 ---
 
@@ -123,17 +126,17 @@ Ye rules `chain/src/consensus.rs` ke constants se jude hain:
 
 | Cheez | Proposal | Code me abhi |
 |---|---|---|
-| Validator banne ke liye minimum stake | **1% se 5% tak — RELEASED supply ka** — FINAL (Sanjay, 2026-11-07) | Code me abhi `MIN_STAKE = 100 * BITS_PER_BUT` (100 BUT placeholder) — released-supply tracking chain me judne par ye badlega (Phase 3) |
+| Validator banne ke liye minimum stake | **1% se 5% tak — RELEASED supply ka** — FINAL (Sanjay, 2026-11-07) | Code me hai (Phase 3a): `min_stake_for(released_supply)` = released supply ka 1% (floor); purana 100 BUT placeholder hata diya gaya |
 | Minimum stake ka base | **Released (circulating) supply** — total supply ka nahi | Sanjay ka faisla: jitni supply release hoti jayegi, uska 1-5%. Jaise aaj aadhi supply release hai to uska 1-5%; released supply badhti jayegi to 1-5% usi hisaab se badhta jayega |
-| Staking lock tiers | **90 din → 180 din → 1 saal → 2 saal → 3 saal → 5 saal** — FINAL (Sanjay, 2026-11-07) | Code me NAHI hai — staking lock tiers Phase 3 me |
-| Unstake par release | **72 ghanton ke andar, dheere-dheere** — ek saath nahi | Code me NAHI hai — Phase 3 me |
+| Staking lock tiers | **90 din → 180 din → 1 saal → 2 saal → 3 saal → 5 saal** — FINAL (Sanjay, 2026-11-07) | Code me hai (Phase 3a): `chain/src/staking.rs` me `LockTier` — stake karte hi coins lock hote hain, kharch nahi ho sakte |
+| Unstake par release | **72 ghanton ke andar, dheere-dheere** — ek saath nahi | Code me hai (Phase 3a): `Unbonding` — 72 ghante me linear gradual release, claim se milega |
 | Proposer chunav | Stake-weighted (zyada stake = zyada chance) | Code me hai (`proposer_for_round`) |
 | Block final hone ke liye vote | Kul active stake ke **2/3 se zyada** approvals | Code me hai (`VoteTally::has_quorum_for`) |
 | Slashing — equivocation (ek height par do blocks ko vote) | Stake ka **10%** kat jayega | Code me hai (`SLASH_PERCENT = 10`) |
 | Slashing — baar-baar galat kaam | Stake `MIN_STAKE` se neeche gira to **jail** | Code me hai |
-| Unbonding period (unstake ke baad coins kab wapas milenge) | **Tiers: pehle 90 din, phir 180 din, phir 1 saal, 2 saal, 3 saal, 5 saal** — FINAL (Sanjay, 2026-11-07) | Code me NAHI hai — stake abhi chain-state se juda nahi hai (Phase 3) |
+| Unbonding period (unstake ke baad coins kab wapas milenge) | **Tiers: pehle 90 din, phir 180 din, phir 1 saal, 2 saal, 3 saal, 5 saal** — FINAL (Sanjay, 2026-11-07) | Code me hai (Phase 3a): lock tiers lock period hain; unstake par 72 ghante me dheere-dheere release (doc §6 note wali samajh ke hisaab se) |
 | Unbonding par note | Sanjay ne "staking" tiers bataye hain — 90 din se 5 saal tak. Ye tiers lock period hain ya unbonding period, ye samajh record ki gayi hai: **staking lock tiers + unstake par 72 ghante me dheere-dheere release**. Agar Sanjay ka matlab kuch aur tha to ye badlega. Dusri chains se tulna: Cosmos me unbonding 21 din, Ethereum me kuch din — 90 din se 5 saal bahut lamba hai, isse staking kam ho sakti hai | — |
-| Jail se wapas aana | Dobara stake karke (stake ≥ 100 BUT) | Code me hai (`restake`) |
+| Jail se wapas aana | Dobara stake karke (stake ≥ min stake — released supply ka 1%) | Code me hai (`restake`) |
 
 ---
 
@@ -154,7 +157,7 @@ Ye rules `chain/src/consensus.rs` ke constants se jude hain:
 2. **Total supply kitni? — FINAL: max 1 billion BUT, dheere-dheere release hogi.** Demand aur value ke hisaab se release hogi, sari ek saath unlock nahi hogi. Code me `MAX_SUPPLY_BUT = 1_000_000_000` likha gaya. Release schedule ka exact formula PENDING hai.
 3. **§3 wali baant (%) — PARTLY FINAL: rewards 23%, community 17%, team 1%.** Team pehle 10% tha, report padhne ke baad Sanjay ne **1%** kar diya (2026-11-07). Baaki 59% (public sale / treasury / ecosystem) PENDING hai — khali hue 9% ka hissa bhi isme hai.
 4. **Block reward kitna? — FINAL (principle): demand ke hisaab se hoga.** Fixed number nahi hai. Exact formula PENDING hai (demand kaise naapi jayegi).
-5. **Minimum stake kitna? — FINAL: 1% se 5% tak, RELEASED supply ka.** Jitni supply release hoti jayegi, uska 1-5% (jaise aadhi supply release hai to uska 1-5%). Code me abhi 100 BUT placeholder hai — released-supply tracking judne par badlega (Phase 3).
+5. **Minimum stake kitna? — FINAL: 1% se 5% tak, RELEASED supply ka.** Jitni supply release hoti jayegi, uska 1-5% (jaise aadhi supply release hai to uska 1-5%). Code me hai (Phase 3a): `min_stake_for(released_supply)` = released supply ka 1% (floor); purana 100 BUT placeholder hata diya gaya.
 6. **Fees — FINAL (principle): Solana jaisi bilkul kam, bits me kategi.** Exact minimum fee number PENDING hai. Fee burn: abhi nahi.
 7. **Unbonding / staking tiers — FINAL: 90 din → 180 din → 1 saal → 2 saal → 3 saal → 5 saal.** Unstake par release **72 ghanton ke andar, dheere-dheere** — ek saath nahi. (Samajh note §6 me dekho.)
 8. **Supply khatm hone ke baad (endgame) — FINAL: jab poori supply release ho jayegi to na rewards, na community, na team — blockchain poori tarah swatantra ho jayega.** Uske baad jo fees kategi, wo ek main wallet me ikatthi hogi; usse rewards dheere-dheere validators ko jayenge aur thoda hissa team ko batega; community ko us phase me kuch nahi milega.
@@ -280,8 +283,12 @@ Jab poori 1 billion supply release ho jayegi:
   karne se koi rokega nahi, par milega utna hi jitna pool me hai.
 
 > Sanjay ne ek blockchain me aisa hi dekha tha — wahan bhi swap
-> available liquidity tak hi hota hai. Ye rule swaps/AMM ke design me
-> likha jayega jab swap feature banega (abhi swap feature nahi bana hai).
+> available liquidity tak hi hota hai. **Ye rule Phase 3b me ban gaya
+> hai** — `chain/src/swap.rs` (AMM x·y=k, `quote()` se swap se pehle
+> disclosure, SwapOp) + API `GET /swap/quote`, `POST /swap`,
+> `GET /swap/pools` + CLI `swap-quote` / `swap`. Swap kabhi fail nahi
+> hota liquidity ki kami se — output AMM formula se milta hai (0 bhi ho
+> sakta hai), input poora pool me jata hai, koi IOU nahi.
 >
 > **Kyun ye rule hai (Sanjay ne bataya):** Bitcoin/Binance ke saath hue
 > hack wale haadson me hackers ne chori ke coins ko swap kiya tha — isliye
@@ -388,5 +395,8 @@ aur Gold kabhi launch nahi honge.)
   rasta hai — BUT se hokar.
 - Isse BUT ki demand banti hai — har bahar ka coin pehle BUT kharidega.
 
-> Ye rule swap/bridge ke design me likha jayega jab swap feature banega
-> (abhi swap feature nahi bana hai).
+> **Ye rule Phase 3b me ban gaya hai** — `chain/src/swap.rs` me
+> `SwapOp::verify()` seedha BTC → BUT Coin (ya kisi bhi bahar ke coin →
+> BUT Coin) reject karta hai, aur API `GET /swap/quote` bhi wahi reject
+> karta hai. Rasta hamesha BTC → BUT → BUT Coin hi hai. (Bridge abhi
+> nahi bana hai — bahar ke coins ka on-chain swap abhi nahi hota.)

@@ -204,6 +204,82 @@ impl ButPayRegistry {
     pub fn handle_for_address(&self, address: &str) -> Option<&str> {
         self.handles_by_address.get(address).map(|s| s.as_str())
     }
+
+    /// Saari entries (ID ke order me) — P2P sync ke liye.
+    /// Entries `ButPayEntry` ki list hoti hain (id, address, handle).
+    pub fn entries(&self) -> Vec<ButPayEntry> {
+        let mut ids: Vec<u64> = self.by_id.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .filter_map(|id| {
+                let address = self.by_id.get(id)?.clone();
+                Some(ButPayEntry {
+                    id: *id,
+                    address: address.clone(),
+                    handle: self.handles_by_address.get(&address).cloned(),
+                })
+            })
+            .collect()
+    }
+
+    /// Doosre node ki registry ko apni registry me milao (P2P sync).
+    /// Immutable-merge rules — entry ek baar jud gayi to kabhi nahi badalti:
+    /// 1. Jo entry pehle se hai (wahi ID + wahi address) wo jaisi ki taisi.
+    /// 2. **Conflict reject:** wahi ID kisi AUR address par ho, ya wahi
+    ///    address kisi AUR ID par ho, ya wahi handle kisi AUR address par
+    ///    ho — poora merge reject hota hai (kuch bhi nahi milta). Aisa tab
+    ///    hota hai jab do nodes ne ek hi ID do alag logo ko de di ho —
+    ///    uska hal manual hai (kis node ki chain sahi hai, wo dekhna).
+    /// 3. `next_id` = dono me se bada (taaki agli ID kabhi takraye nahi).
+    /// Returns: kitni nayi entries judi.
+    pub fn merge(&mut self, other: &ButPayRegistry) -> Result<usize> {
+        // Pehle saare conflict check karo — ek bhi conflict ho to kuch
+        // bhi merge mat karo (all-or-nothing).
+        for (id, address) in &other.by_id {
+            if let Some(existing) = self.by_id.get(id) {
+                if existing != address {
+                    return Err(ButError::InvalidTransaction(format!(
+                        "BUT Pay registry conflict: ID {id} is node par {existing} hai, doosre node par {address} — merge nahi hoga"
+                    )));
+                }
+            }
+            if let Some(existing_id) = self.by_address.get(address) {
+                if existing_id != id {
+                    return Err(ButError::InvalidTransaction(format!(
+                        "BUT Pay registry conflict: {address} ki ID is node par {existing_id} hai, doosre node par {id} — merge nahi hoga"
+                    )));
+                }
+            }
+        }
+        for (handle, address) in &other.by_handle {
+            if let Some(existing) = self.by_handle.get(handle) {
+                if existing != address {
+                    return Err(ButError::InvalidTransaction(format!(
+                        "BUT Pay registry conflict: naam @{handle} is node par {existing} hai, doosre node par {address} — merge nahi hoga"
+                    )));
+                }
+            }
+        }
+        // Koi conflict nahi — nayi entries jodo.
+        let mut added = 0;
+        for (id, address) in &other.by_id {
+            if self.by_id.contains_key(id) {
+                continue;
+            }
+            self.by_id.insert(*id, address.clone());
+            self.by_address.insert(address.clone(), *id);
+            if let Some(h) = other.handles_by_address.get(address) {
+                self.by_handle.insert(h.clone(), address.clone());
+                self.handles_by_address.insert(address.clone(), h.clone());
+            }
+            added += 1;
+        }
+        // next_id bada wala rakho (dono me se).
+        if other.next_id > self.next_id {
+            self.next_id = other.next_id;
+        }
+        Ok(added)
+    }
 }
 
 /// Handle normalize karo: aas-paas ki khaali jagah hatao, aage ka '@'
@@ -372,5 +448,68 @@ mod tests {
         let carol = test_wallet(3);
         assert_eq!(loaded.register(&carol.address, None).unwrap(), 100003);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_nayi_entries_jodta_hai_next_id_bada_rakhta_hai() {
+        let alice = test_wallet(1);
+        let bob = test_wallet(2);
+        let carol = test_wallet(3);
+        // Node A: Alice (100001, @sanjay) + Bob (100002).
+        let mut a = ButPayRegistry::new();
+        a.register(&alice.address, Some("sanjay")).unwrap();
+        a.register(&bob.address, None).unwrap();
+        // Node B: wahi Alice + Bob + Carol (100003).
+        let mut b = ButPayRegistry::new();
+        b.register(&alice.address, Some("sanjay")).unwrap();
+        b.register(&bob.address, None).unwrap();
+        b.register(&carol.address, Some("carol")).unwrap();
+        // A me B merge karo — sirf Carol nayi hai.
+        let added = a.merge(&b).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.resolve("carol").unwrap(), carol.address);
+        assert_eq!(a.resolve("100003").unwrap(), carol.address);
+        // next_id bada wala (100004).
+        assert_eq!(a.next_id, 100004);
+        // Dobara merge — kuch naya nahi.
+        assert_eq!(a.merge(&b).unwrap(), 0);
+        // entries() ID order me aati hain.
+        let entries = a.entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, 100001);
+        assert_eq!(entries[2].id, 100003);
+    }
+
+    #[test]
+    fn merge_id_conflict_reject_poora_merge_nahi_hota() {
+        let alice = test_wallet(1);
+        let bob = test_wallet(2);
+        let carol = test_wallet(3);
+        // Node A: Alice ko 100001 di.
+        let mut a = ButPayRegistry::new();
+        a.register(&alice.address, None).unwrap();
+        // Node B: Bob ko 100001 di (takraav!) + Carol ko 100002.
+        let mut b = ButPayRegistry::new();
+        b.register(&bob.address, None).unwrap();
+        b.register(&carol.address, None).unwrap();
+        // Merge reject hona chahiye — aur A me kuch bhi nahi judna chahiye.
+        let err = a.merge(&b).unwrap_err();
+        assert!(err.to_string().contains("conflict"));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a.next_id, 100002);
+        assert!(a.resolve("100002").is_none());
+    }
+
+    #[test]
+    fn merge_handle_conflict_reject() {
+        let alice = test_wallet(1);
+        let bob = test_wallet(2);
+        let mut a = ButPayRegistry::new();
+        a.register(&alice.address, Some("sanjay")).unwrap();
+        let mut b = ButPayRegistry::new();
+        b.register(&bob.address, Some("sanjay")).unwrap();
+        assert!(a.merge(&b).is_err());
+        assert_eq!(a.len(), 1);
     }
 }

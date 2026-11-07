@@ -1,11 +1,16 @@
-//! P2P network — Phase 2: nodes TCP se aapas me judte hain.
+//! P2P network — Phase 2 (sync + tx gossip), Phase 3a (vote gossip).
 //!
 //! Kya kar sakta hai:
 //! - Ek node doosre node se apni chain ki height aur latest hash poochh sakta hai.
 //! - Node doosre node se missing blocks maang kar apni chain sync kar sakta hai
-//!   (har block `Chain::add_block` se poori tarah verify hokar hi judta hai).
+//!   (har block `Chain::add_block_bft` se poori tarah verify hokar hi judta
+//!   hai — votes block ke andar embedded hote hain, isliye sync karne wala
+//!   node bhi quorum check kar sakta hai).
 //! - Pending transactions ek node se doosre node tak bhej sakta hai
 //!   (mempool me jaane se pehle signature verify hoti hai).
+//! - BFT votes gossip hote hain: validator apna vote peers ko bhejta hai,
+//!   peer vote verify karke apni tally me rakhta hai, aur proposer votes
+//!   maang kar quorum bana sakta hai.
 //!
 //! KYUN PLAIN TCP (libp2p kyun nahi)?
 //! - **Std-only, koi bhaari dependency nahi**: libp2p ya axum jaise bade
@@ -25,15 +30,21 @@
 //!
 //! SACH BATA RAHE HAIN — kya abhi bhi simplified hai:
 //! - **No fork choice / reorg**: sync sirf apni chain ko AAGE badhata hai.
-//!   Peer ki chain alag nikli (diverged) to `add_block` prev-hash mismatch
-//!   par reject kar dega — node apni purani chain par hi rahega, lambi
-//!   chain ko apnana (reorg) abhi nahi hota.
+//!   Peer ki chain alag nikli (diverged) to `add_block_bft` prev-hash
+//!   mismatch par reject kar dega — node apni purani chain par hi rahega,
+//!   lambi chain ko apnana (reorg) abhi nahi hota.
 //! - **No encryption / authentication**: koi bhi TCP client node se jud
 //!   sakta hai. Blocks aur transactions khud verify hote hain (signature +
 //!   hash), isliye galat data chain me nahi ghus sakta — par node ko spam
 //!   requests se pareshan kiya ja sakta hai (rate limiting abhi nahi hai).
-//! - **No vote gossip**: BFT votes abhi P2P par nahi ghoomte — vote sirf
-//!   `consensus.rs` ke andar test hote hain. Vote gossip Phase 3 ka kaam hai.
+//! - **Vote gossip hai, par basic**: votes verify hokar tally me jate hain
+//!   aur maange ja sakte hain. Equivocation (ek hi height par do alag
+//!   blocks ko vote) par ab block-level SlashOp banta hai —
+//!   `Node::report_equivocation` se (Phase 3b). Downtime par slash abhi nahi.
+//! - **Registry sync hai, par basic**: BUT Pay registry peers se sync hoti
+//!   hai (merge, conflict par reject — Phase 3b). Registry entries khud
+//!   on-chain nahi hain (chain me sirf transactions hain) — isliye do
+//!   nodes ki registry alag ho sakti hai; merge conflict ka hal manual hai.
 //! - **Request-response, ek connection = ek request**: har request ke liye
 //!   naya TCP connection khulta hai. Persistent peer connections abhi nahi hain.
 //!
@@ -41,11 +52,16 @@
 //! jawab me hamesha ek JSON line milti hai.
 
 use crate::block::Block;
+use crate::butpay::ButPayRegistry;
 use crate::chain::Chain;
+use crate::consensus::{Vote, VoteTally};
 use crate::error::{ButError, Result};
 use crate::mempool::Mempool;
+use crate::slash::SlashOp;
 use crate::transaction::Transaction;
+use crate::wallet::Wallet;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -70,11 +86,22 @@ pub enum P2pMessage {
     Blocks { blocks: Vec<Block> },
     /// Pending transaction doosre node ko bhejo.
     AnnounceTx { tx: Transaction },
+    /// BFT vote doosre node ko bhejo — peer verify karke apni tally me rakhega.
+    AnnounceVote { vote: Vote },
+    /// Kisi height ke votes maango.
+    GetVotes { height: u64 },
+    /// Maange hue votes.
+    Votes { votes: Vec<Vote> },
+    /// Peer ki BUT Pay registry maango (ID/handle → address).
+    GetRegistry,
+    /// Peer ki poori BUT Pay registry (merge karke sync hogi).
+    Registry { registry: ButPayRegistry },
     /// Kisi request ka seedha jawab — kaam hua ya nahi.
     Ack { ok: bool, message: String },
 }
 
-/// Ek BUT node — chain + mempool + peers, threads ke beech shareable.
+/// Ek BUT node — chain + mempool + peers + vote tallies + BUT Pay registry,
+/// threads ke beech shareable.
 #[derive(Debug, Clone)]
 pub struct Node {
     /// Is node ki chain (server thread aur API thread dono use karte hain).
@@ -83,15 +110,28 @@ pub struct Node {
     pub mempool: Arc<Mutex<Mempool>>,
     /// Jaane hue peers — "127.0.0.1:9001" jaise addresses.
     pub peers: Arc<Mutex<Vec<String>>>,
+    /// Height ke hisaab se vote tallies — gossip se aaye votes yahan jama hote hain.
+    pub tallies: Arc<Mutex<HashMap<u64, VoteTally>>>,
+    /// Is node ki BUT Pay registry (ID/handle → address) — peers se sync
+    /// hoti hai (Phase 3b). ID wale transactions wale blocks isi registry
+    /// se verify hote hain.
+    pub registry: Arc<Mutex<ButPayRegistry>>,
 }
 
 impl Node {
-    /// Chain se naya node banao.
+    /// Chain se naya node banao (registry khaali shuru hoti hai).
     pub fn new(chain: Chain) -> Self {
+        Self::with_registry(chain, ButPayRegistry::new())
+    }
+
+    /// Chain + registry se naya node banao (pehle se bhari registry ke saath).
+    pub fn with_registry(chain: Chain, registry: ButPayRegistry) -> Self {
         Self {
             chain: Arc::new(Mutex::new(chain)),
             mempool: Arc::new(Mutex::new(Mempool::new())),
             peers: Arc::new(Mutex::new(Vec::new())),
+            tallies: Arc::new(Mutex::new(HashMap::new())),
+            registry: Arc::new(Mutex::new(registry)),
         }
     }
 
@@ -165,11 +205,203 @@ impl Node {
                     },
                 }
             }
+            P2pMessage::AnnounceVote { vote } => {
+                // Vote verify karo (signature + voter active validator hai),
+                // phir us height ki tally me rakho. Galat vote reject.
+                match self.record_vote(vote) {
+                    Ok(()) => P2pMessage::Ack {
+                        ok: true,
+                        message: "vote tally me aa gaya".to_string(),
+                    },
+                    Err(e) => P2pMessage::Ack {
+                        ok: false,
+                        message: format!("vote reject: {e}"),
+                    },
+                }
+            }
+            P2pMessage::GetVotes { height } => {
+                let votes = self
+                    .tallies
+                    .lock()
+                    .unwrap()
+                    .get(&height)
+                    .map(|t| t.votes.clone())
+                    .unwrap_or_default();
+                P2pMessage::Votes { votes }
+            }
+            P2pMessage::Votes { .. } => P2pMessage::Ack {
+                ok: false,
+                message: "Votes ek jawab hai, request nahi".to_string(),
+            },
+            P2pMessage::GetRegistry => {
+                let registry = self.registry.lock().unwrap().clone();
+                P2pMessage::Registry { registry }
+            }
+            P2pMessage::Registry { .. } => P2pMessage::Ack {
+                ok: false,
+                message: "Registry ek jawab hai, request nahi".to_string(),
+            },
             other => P2pMessage::Ack {
                 ok: false,
                 message: format!("ye message request nahi hai: {other:?}"),
             },
         }
+    }
+
+    /// Ek vote verify karke is node ki tally me rakho.
+    /// Equivocation (ek hi height par do alag blocks ko vote) yahan log
+    /// hoti hai — vote ko reject nahi karte (conflicting vote hi saboot
+    /// hai). Slash ke liye `report_equivocation` chalao — wo tally ke
+    /// saboot se signed SlashOp banakar mempool me dalta hai (Phase 3b).
+    pub fn record_vote(&self, vote: Vote) -> Result<()> {
+        vote.verify()?;
+        let validators = {
+            let chain = self.chain.lock().unwrap();
+            chain.validators.clone()
+        };
+        let mut tallies = self.tallies.lock().unwrap();
+        let tally = tallies
+            .entry(vote.height)
+            .or_insert_with(|| VoteTally::new(vote.height));
+        if tally.add_vote(vote.clone(), &validators).is_err() {
+            // Duplicate ya non-validator vote — tally nahi badli.
+            return Err(ButError::InvalidVote(
+                "vote tally me nahi joda ja saka (duplicate ya voter validator nahi hai)"
+                    .to_string(),
+            ));
+        }
+        let bad = tally.equivocators();
+        if !bad.is_empty() {
+            eprintln!(
+                "WARNING: equivocation dekha gaya height {} par: {:?} — slash ke liye report_equivocation chalao",
+                vote.height, bad
+            );
+        }
+        Ok(())
+    }
+
+    /// Kisi height ki tally me equivocation ho to us par slash report karo.
+    /// Har equivocator ke liye ek signed SlashOp banata hai (reporter ki
+    /// key se, uske current nonce ke saath) aur mempool me dalta hai —
+    /// agla block banega to slash op usme jayega.
+    /// Returns: banaye gaye slash ops (koi equivocation na ho to khaali).
+    /// Note: reporter ka nonce chain se liya jata hai — reporter ne beech
+    /// me koi tx ki ho to nonce badal jayega; op tab bhi banega, par block
+    /// apply karte waqt nonce galat hua to reject hoga (dobara chalao).
+    pub fn report_equivocation(&self, reporter: &Wallet, height: u64) -> Result<Vec<SlashOp>> {
+        let tally = {
+            let tallies = self.tallies.lock().unwrap();
+            match tallies.get(&height) {
+                Some(t) => t.clone(),
+                None => return Ok(Vec::new()),
+            }
+        };
+        let equivocators = tally.equivocators();
+        if equivocators.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reporter_nonce = {
+            let chain = self.chain.lock().unwrap();
+            chain.nonces.get(&reporter.address).copied().unwrap_or(0)
+        };
+        let mut ops = Vec::new();
+        let mut nonce = reporter_nonce;
+        for target in equivocators {
+            // Is target ke do conflicting votes (alag block hash) nikalo.
+            let conflicting: Vec<Vote> = tally
+                .votes
+                .iter()
+                .filter(|v| v.voter == target && v.approve)
+                .cloned()
+                .collect();
+            let mut pair: Option<(Vote, Vote)> = None;
+            'outer: for i in 0..conflicting.len() {
+                for j in (i + 1)..conflicting.len() {
+                    if conflicting[i].block_hash != conflicting[j].block_hash {
+                        pair = Some((conflicting[i].clone(), conflicting[j].clone()));
+                        break 'outer;
+                    }
+                }
+            }
+            let (vote_a, vote_b) = match pair {
+                Some(p) => p,
+                None => continue, // saboot adhura hai — is target ko chhodo
+            };
+            let mut op = SlashOp::new(
+                target.clone(),
+                vote_a,
+                vote_b,
+                format!("equivocation height {height} par do alag blocks ko vote"),
+                reporter.address.clone(),
+                nonce,
+            );
+            op.sign(&reporter.signing_key())?;
+            {
+                let mut pool = self.mempool.lock().unwrap();
+                pool.add_slash_op(op.clone())?;
+            }
+            nonce += 1;
+            ops.push(op);
+        }
+        Ok(ops)
+    }
+
+    /// Is node ke validator wallet se block par vote banao, apni tally me
+    /// rakho aur saare peers ko gossip karo. Vote tabhi banta hai jab
+    /// wallet active validator ho.
+    pub fn vote_for_block(&self, block: &Block, wallet: &Wallet) -> Result<Vote> {
+        {
+            let chain = self.chain.lock().unwrap();
+            chain.validators.authorize_block(&wallet.address)?;
+        }
+        let vote = Vote::new(
+            block.hash.clone(),
+            block.index,
+            true,
+            wallet.address.clone(),
+            &wallet.signing_key(),
+        )?;
+        self.record_vote(vote.clone())?;
+        self.gossip_vote_to_peers(&vote);
+        Ok(vote)
+    }
+
+    /// Vote saare peers ko bhejo. Koi peer band ho ya reject kare to sirf
+    /// log karo — gossip best-effort hai, ek peer ki galti se vote nahi rukta.
+    pub fn gossip_vote_to_peers(&self, vote: &Vote) {
+        let peers = self.peers.lock().unwrap().clone();
+        for peer in peers {
+            if let Err(e) = Self::announce_vote(&peer, vote) {
+                eprintln!("peer {peer} ko vote gossip nahi hua: {e}");
+            }
+        }
+    }
+
+    /// Kisi height ke votes jama karo: pehle apni tally, phir har peer se
+    /// GetVotes. Voter ke hisaab se duplicate hatate hain. Returns: votes.
+    /// Quorum check caller karega (`VoteTally::has_quorum_for`).
+    pub fn collect_votes_for_block(&self, height: u64) -> Vec<Vote> {
+        let mut out: Vec<Vote> = self
+            .tallies
+            .lock()
+            .unwrap()
+            .get(&height)
+            .map(|t| t.votes.clone())
+            .unwrap_or_default();
+        let peers = self.peers.lock().unwrap().clone();
+        for peer in peers {
+            match Self::request_votes(&peer, height) {
+                Ok(votes) => {
+                    for v in votes {
+                        if !out.iter().any(|o| o.voter == v.voter) {
+                            out.push(v);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("peer {peer} se votes nahi mile: {e}"),
+            }
+        }
+        out
     }
 
     /// Listener par `n` connections handle karke band ho jao.
@@ -236,7 +468,40 @@ impl Node {
         }
     }
 
-    /// Peer se chain sync karo: missing blocks maango, verify karke add karo.
+    /// Peer se BUT Pay registry sync karo (Phase 3b).
+    /// Peer ki registry apni registry me merge hoti hai (immutable-merge
+    /// rules — conflict ho to poora merge reject, kuch nahi milta).
+    /// Returns: kitni nayi entries judi.
+    /// Best-effort hai — peer band ho ya registry na mile to error; caller
+    /// (sync_from_peer) us error ko sirf log karta hai, sync nahi rokta.
+    pub fn sync_registry_from_peer(&self, peer: &str) -> Result<usize> {
+        let peer_registry = Self::request_registry(peer)?;
+        let mut registry = self.registry.lock().unwrap();
+        registry.merge(&peer_registry)
+    }
+
+    /// Peer se uski poori BUT Pay registry maango.
+    pub fn request_registry(peer: &str) -> Result<ButPayRegistry> {
+        let stream = connect(peer)?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|e| {
+            ButError::Network(format!("connection clone nahi hua: {e}"))
+        })?);
+        let mut writer = stream;
+        send_message(&mut writer, &P2pMessage::GetRegistry)?;
+        match read_message(&mut reader)? {
+            P2pMessage::Registry { registry } => Ok(registry),
+            other => Err(ButError::Network(format!(
+                "peer se Registry jawab chahiye tha, mila: {other:?}"
+            ))),
+        }
+    }
+
+    /// Peer se chain sync karo: **pehle registry, phir blocks**.
+    /// Registry pehle sync hoti hai taaki ID/handle wale transactions
+    /// wale blocks bhi verify hokar jud sakein (Phase 3b).
+    /// Registry sync best-effort hai — peer ki registry na mile ya merge
+    /// conflict ho to sirf warning log hogi, block sync phir bhi chalega
+    /// (ID wale blocks tab fail ho sakte hain, registry baad me sync hogi).
     /// Returns: kitne blocks jode gaye.
     /// Peer ki chain chhoti ho ya barabar ho to 0 return karta hai.
     /// Peer ki chain alag nikli (diverged) to error — apni chain nahi badalti
@@ -248,12 +513,34 @@ impl Node {
         if peer_height <= own_height {
             return Ok(0);
         }
+        // Step 1: registry sync (best-effort).
+        match self.sync_registry_from_peer(peer) {
+            Ok(added) => {
+                if added > 0 {
+                    eprintln!("peer {peer} se {added} BUT Pay entries sync hui");
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARNING: peer {peer} se registry sync nahi hui: {e} — block sync phir bhi chalega"
+                );
+            }
+        }
         let blocks = Self::request_blocks(peer, own_height as u64)?;
         let mut added = 0usize;
         for block in blocks {
             {
                 let mut chain = self.chain.lock().unwrap();
-                chain.add_block(block)?;
+                // Block ke andar embedded votes se tally banao — bina votes
+                // wala block sync nahi hoga (BFT-only, sahi hai).
+                // Registry node ki apni (sync hui) registry hai — ID wale
+                // txs wale blocks bhi sync honge (Phase 3b).
+                let registry = self.registry.lock().unwrap().clone();
+                let mut tally = VoteTally::new(block.index);
+                for vote in &block.votes {
+                    tally.add_vote(vote.clone(), &chain.validators)?;
+                }
+                chain.add_block_bft_with_registry(block, &tally, &registry)?;
             }
             added += 1;
         }
@@ -280,6 +567,46 @@ impl Node {
             P2pMessage::Blocks { blocks } => Ok(blocks),
             other => Err(ButError::Network(format!(
                 "peer se Blocks jawab chahiye tha, mila: {other:?}"
+            ))),
+        }
+    }
+
+    /// Peer ko ek BFT vote bhejo. Returns: peer ne tally me liya ya nahi.
+    pub fn announce_vote(peer: &str, vote: &Vote) -> Result<bool> {
+        let stream = connect(peer)?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|e| {
+            ButError::Network(format!("connection clone nahi hua: {e}"))
+        })?);
+        let mut writer = stream;
+        send_message(
+            &mut writer,
+            &P2pMessage::AnnounceVote { vote: vote.clone() },
+        )?;
+        match read_message(&mut reader)? {
+            P2pMessage::Ack { ok, message } => {
+                if !ok {
+                    eprintln!("peer ne vote reject kiya: {message}");
+                }
+                Ok(ok)
+            }
+            other => Err(ButError::Network(format!(
+                "peer se Ack jawab chahiye tha, mila: {other:?}"
+            ))),
+        }
+    }
+
+    /// Peer se kisi height ke votes maango.
+    pub fn request_votes(peer: &str, height: u64) -> Result<Vec<Vote>> {
+        let stream = connect(peer)?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|e| {
+            ButError::Network(format!("connection clone nahi hua: {e}"))
+        })?);
+        let mut writer = stream;
+        send_message(&mut writer, &P2pMessage::GetVotes { height })?;
+        match read_message(&mut reader)? {
+            P2pMessage::Votes { votes } => Ok(votes),
+            other => Err(ButError::Network(format!(
+                "peer se Votes jawab chahiye tha, mila: {other:?}"
             ))),
         }
     }
@@ -361,6 +688,7 @@ mod tests {
 
     /// Genesis + `n_blocks` transfer blocks wali chain.
     /// Sab nodes ke liye wahi genesis params — taaki genesis hash ek ho.
+    /// Blocks BFT se judte hain (validator ka self-vote, bootstrap quorum).
     fn chain_with_blocks(n_blocks: u64) -> Chain {
         let validator = test_wallet(9);
         let alice = test_wallet(1);
@@ -382,8 +710,9 @@ mod tests {
             );
             tx.sign(&alice.signing_key()).unwrap();
             nonce_alice += 1;
+            let height = chain.height() as u64;
             let block = Block::new(
-                chain.height() as u64,
+                height,
                 1_700_000_001 + i,
                 chain.latest_hash(),
                 vec![tx],
@@ -391,7 +720,17 @@ mod tests {
                 &validator.signing_key(),
             )
             .unwrap();
-            chain.add_block(block).unwrap();
+            let mut tally = VoteTally::new(height);
+            let vote = Vote::new(
+                block.hash.clone(),
+                height,
+                true,
+                validator.address.clone(),
+                &validator.signing_key(),
+            )
+            .unwrap();
+            tally.add_vote(vote, &chain.validators).unwrap();
+            chain.add_block_bft(block, &tally).unwrap();
         }
         chain
     }
@@ -413,8 +752,8 @@ mod tests {
         let node_a = Node::new(chain_with_blocks(2));
         let node_b = Node::new(chain_with_blocks(0));
         assert_eq!(node_b.height_and_hash().0, 1);
-        // Sync me 2 connections hote hain: Hello + GetBlocks.
-        let (addr_a, handle) = serve_test_node(node_a, 2);
+        // Sync me 3 connections hote hain: Hello + GetRegistry + GetBlocks.
+        let (addr_a, handle) = serve_test_node(node_a, 3);
         let added = node_b.sync_from_peer(&addr_a).unwrap();
         handle.join().unwrap();
         assert_eq!(added, 2);
@@ -485,8 +824,8 @@ mod tests {
         .unwrap();
         let node_a = Node::new(chain_with_blocks(1));
         let node_b = Node::new(chain_b);
-        // Sync me 2 connections: Hello + GetBlocks, par block add fail hoga.
-        let (addr_a, handle) = serve_test_node(node_a, 2);
+        // Sync me 3 connections: Hello + GetRegistry + GetBlocks, par block add fail hoga.
+        let (addr_a, handle) = serve_test_node(node_a, 3);
         let result = node_b.sync_from_peer(&addr_a);
         handle.join().unwrap();
         assert!(result.is_err());
@@ -500,5 +839,300 @@ mod tests {
         let node_b = Node::new(chain_with_blocks(0));
         let result = node_b.sync_from_peer("127.0.0.1:1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn vote_gossip_dusre_node_tak_pahunchta_hai() {
+        // Node A aur B dono sirf genesis par hain.
+        let node_a = Node::new(chain_with_blocks(0));
+        let node_b = Node::new(chain_with_blocks(0));
+        let validator = test_wallet(9);
+        let alice = test_wallet(1);
+        let bob = test_wallet(2);
+        // A block 1 banata hai (abhi add nahi karta) aur us par vote karta hai.
+        let mut tx = Transaction::new(alice.address.clone(), bob.address.clone(), 100, 0, 0);
+        tx.sign(&alice.signing_key()).unwrap();
+        let block = Block::new(
+            1,
+            1_700_000_001,
+            node_a.height_and_hash().1,
+            vec![tx],
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        let vote = Vote::new(
+            block.hash.clone(),
+            1,
+            true,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        // B ke paas abhi koi vote nahi hai.
+        assert!(node_b
+            .tallies
+            .lock()
+            .unwrap()
+            .get(&1)
+            .map(|t| t.votes.len())
+            .unwrap_or(0)
+            == 0);
+        // 1 connection: A ka AnnounceVote B tak.
+        let (addr_b, handle) = serve_test_node(node_b.clone(), 1);
+        let ok = Node::announce_vote(&addr_b, &vote).unwrap();
+        handle.join().unwrap();
+        assert!(ok);
+        // B ki tally me vote aa gaya.
+        let tally = node_b.tallies.lock().unwrap();
+        let votes = &tally.get(&1).unwrap().votes;
+        assert_eq!(votes.len(), 1);
+        assert_eq!(votes[0].voter, validator.address);
+        assert_eq!(votes[0].block_hash, block.hash);
+    }
+
+    #[test]
+    fn votes_maange_ja_sakte_hain_aur_gossip_se_block_judta_hai() {
+        let node_a = Node::new(chain_with_blocks(0));
+        let node_b = Node::new(chain_with_blocks(0));
+        let validator = test_wallet(9);
+        let alice = test_wallet(1);
+        let bob = test_wallet(2);
+        // A block 1 banata hai, vote karta hai, apni tally me rakhta hai.
+        let mut tx = Transaction::new(alice.address.clone(), bob.address.clone(), 100, 0, 0);
+        tx.sign(&alice.signing_key()).unwrap();
+        let block = Block::new(
+            1,
+            1_700_000_001,
+            node_a.height_and_hash().1,
+            vec![tx],
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        let vote = node_a.vote_for_block(&block, &validator).unwrap();
+        assert_eq!(vote.voter, validator.address);
+        // B A se votes maangta hai — 1 vote milega.
+        // 2 connections: GetVotes + (baad me) GetBlocks/Height sync ke liye
+        // nahi — yahan sirf GetVotes ke liye 1 connection.
+        let (addr_a, handle) = serve_test_node(node_a.clone(), 1);
+        let votes = Node::request_votes(&addr_a, 1).unwrap();
+        handle.join().unwrap();
+        assert_eq!(votes.len(), 1);
+        assert_eq!(votes[0].voter, validator.address);
+        // B vote ko apni tally me record kare, phir wahi block BFT se jode.
+        node_b.record_vote(votes[0].clone()).unwrap();
+        let tally = node_b.tallies.lock().unwrap().get(&1).unwrap().clone();
+        let mut chain_b = node_b.chain.lock().unwrap();
+        chain_b.add_block_bft(block, &tally).unwrap();
+        assert_eq!(chain_b.height(), 2);
+        assert_eq!(chain_b.balance(&bob.address), 100);
+        chain_b.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn sync_karte_time_embedded_votes_bhi_verify_hote_hain() {
+        // Node A ke blocks me votes embedded hain — B sync karke quorum
+        // check ke saath judta hai.
+        let node_a = Node::new(chain_with_blocks(2));
+        let node_b = Node::new(chain_with_blocks(0));
+        let (addr_a, handle) = serve_test_node(node_a, 3);
+        let added = node_b.sync_from_peer(&addr_a).unwrap();
+        handle.join().unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(node_b.height_and_hash().0, 3);
+        let chain_b = node_b.chain.lock().unwrap();
+        // Har synced block me vote embedded hai.
+        assert_eq!(chain_b.blocks[1].votes.len(), 1);
+        assert_eq!(chain_b.blocks[2].votes.len(), 1);
+        chain_b.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn registry_sync_aur_id_tx_block_sync() {
+        // Node A: genesis + Bob ki registry entry (100001, @bob) + ID-tx block.
+        let validator = test_wallet(9);
+        let alice = test_wallet(1);
+        let bob = test_wallet(2);
+        let mut chain_a = Chain::new_genesis(
+            vec![(alice.address.clone(), 1_000_000)],
+            &validator,
+            1_700_000_000,
+        )
+        .unwrap();
+        let mut registry_a = ButPayRegistry::new();
+        let bob_id = registry_a.register(&bob.address, Some("bob")).unwrap();
+        assert_eq!(bob_id, 100001);
+        // Block 1: Alice → ID 100001 (Bob) 500 bits.
+        let mut tx = Transaction::new(alice.address.clone(), "100001".to_string(), 500, 0, 0);
+        tx.sign(&alice.signing_key()).unwrap();
+        let block = Block::new(
+            1,
+            1_700_000_001,
+            chain_a.latest_hash(),
+            vec![tx],
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        let mut tally = VoteTally::new(1);
+        let vote = Vote::new(
+            block.hash.clone(),
+            1,
+            true,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        tally.add_vote(vote, &chain_a.validators).unwrap();
+        chain_a
+            .add_block_bft_with_registry(block, &tally, &registry_a)
+            .unwrap();
+        let node_a = Node::with_registry(chain_a, registry_a);
+        // Node B: sirf genesis, registry khaali.
+        let node_b = Node::new(chain_with_blocks(0));
+        assert!(node_b.registry.lock().unwrap().is_empty());
+        // Sync me 3 connections: Hello + GetRegistry + GetBlocks.
+        let (addr_a, handle) = serve_test_node(node_a, 3);
+        let added = node_b.sync_from_peer(&addr_a).unwrap();
+        handle.join().unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(node_b.height_and_hash().0, 2);
+        // Registry sync hui — Bob ki ID aur handle milti hai.
+        {
+            let reg_b = node_b.registry.lock().unwrap();
+            assert_eq!(reg_b.resolve("100001").unwrap(), bob.address);
+            assert_eq!(reg_b.resolve("@bob").unwrap(), bob.address);
+        }
+        // ID-tx block bhi sync hua — Bob ko 500 mile.
+        let chain_b = node_b.chain.lock().unwrap();
+        assert_eq!(chain_b.balance(&bob.address), 500);
+        // NOTE: khaali-registry wala `verify_chain()` ID-tx wali chain ko
+        // verify nahi kar sakta — synced registry ke saath verify karo.
+        let reg_b = node_b.registry.lock().unwrap().clone();
+        chain_b.verify_chain_with_registry(&reg_b).unwrap();
+    }
+
+    #[test]
+    fn registry_sync_bina_block_sync_ke_bhi_hoti_hai() {
+        // Node A ki registry me Bob hai, par chain sirf genesis par hai.
+        let bob = test_wallet(2);
+        let mut registry_a = ButPayRegistry::new();
+        registry_a.register(&bob.address, Some("bob")).unwrap();
+        let node_a = Node::with_registry(chain_with_blocks(0), registry_a);
+        // Node B bhi genesis par hai — height barabar, isliye sync_from_peer
+        // 0 dega, par sync_registry_from_peer seedha chalao.
+        let node_b = Node::new(chain_with_blocks(0));
+        // 1 connection: GetRegistry.
+        let (addr_a, handle) = serve_test_node(node_a, 1);
+        let added = node_b.sync_registry_from_peer(&addr_a).unwrap();
+        handle.join().unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(
+            node_b.registry.lock().unwrap().resolve("100001").unwrap(),
+            bob.address
+        );
+    }
+
+    #[test]
+    fn equivocation_report_se_slash_op_mempool_me_aata_hai() {
+        let node = Node::new(chain_with_blocks(0));
+        let validator = test_wallet(9);
+        let bob = test_wallet(2);
+        // Validator height 1 par do alag blocks ko vote deta hai.
+        let v1 = Vote::new(
+            "a".repeat(64),
+            1,
+            true,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        let v2 = Vote::new(
+            "b".repeat(64),
+            1,
+            true,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        node.record_vote(v1).unwrap();
+        node.record_vote(v2).unwrap();
+        // Bob report karta hai — 1 slash op mempool me aata hai.
+        let ops = node.report_equivocation(&bob, 1).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].target, validator.address);
+        assert_eq!(node.mempool.lock().unwrap().slash_ops_len(), 1);
+        // Slash op wala block banao aur jodo.
+        let slash_ops = node
+            .mempool
+            .lock()
+            .unwrap()
+            .take_slash_ops_for_block(10);
+        let block = Block::new_with_ops(
+            1,
+            1_700_000_001,
+            node.height_and_hash().1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            slash_ops,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        let mut tally = VoteTally::new(1);
+        let vote = Vote::new(
+            block.hash.clone(),
+            1,
+            true,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        tally
+            .add_vote(vote, &node.chain.lock().unwrap().validators)
+            .unwrap();
+        node.chain.lock().unwrap().add_block_bft(block, &tally).unwrap();
+        // Slash apply hua: validator jail hua (stake 0 < min stake) aur
+        // saboot applied set me hai — dobara slash nahi hoga.
+        let chain = node.chain.lock().unwrap();
+        assert!(chain.validators.is_jailed(&validator.address));
+        assert_eq!(chain.applied_slash_ops.len(), 1);
+        chain.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn report_equivocation_bina_saboot_khaali() {
+        let node = Node::new(chain_with_blocks(0));
+        let bob = test_wallet(2);
+        // Koi vote hi nahi hai — kuch report nahi hoga.
+        let ops = node.report_equivocation(&bob, 1).unwrap();
+        assert!(ops.is_empty());
+        assert_eq!(node.mempool.lock().unwrap().slash_ops_len(), 0);
+    }
+
+    #[test]
+    fn galat_vote_reject_hota_hai() {
+        let node_b = Node::new(chain_with_blocks(0));
+        let alice = test_wallet(1); // validator nahi hai
+        let vote = Vote::new(
+            "koi_hash".to_string(),
+            1,
+            true,
+            alice.address.clone(),
+            &alice.signing_key(),
+        )
+        .unwrap();
+        // Alice active validator nahi hai — vote tally me nahi jayega.
+        assert!(node_b.record_vote(vote).is_err());
+        assert!(node_b
+            .tallies
+            .lock()
+            .unwrap()
+            .get(&1)
+            .map(|t| t.votes.len())
+            .unwrap_or(0)
+            == 0);
     }
 }

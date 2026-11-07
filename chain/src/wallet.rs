@@ -102,6 +102,51 @@ impl Wallet {
         })
     }
 
+    /// 128-char private key (hex) se wallet banao — CLI/API ke liye.
+    /// Private key = hex(secret 32 bytes) + hex(public 32 bytes).
+    /// Public key secret se dobara banakar check hoti hai — match na kare
+    /// to key galat hai (error). **Mnemonic is wallet me nahi hoti**
+    /// (private key se mnemonic wapas nahi banti) — `mnemonic` khaali
+    /// rehta hai; ye wallet sirf sign karne ke liye hai, backup ke liye
+    /// nahi. Backup ke liye hamesha 24-word mnemonic chahiye.
+    pub fn from_private_key_hex(private_key_hex: &str) -> Result<Self> {
+        if private_key_hex.len() != PRIVATE_KEY_LENGTH {
+            return Err(ButError::InvalidTransaction(format!(
+                "private key bilkul {PRIVATE_KEY_LENGTH} characters ki honi chahiye, mili: {}",
+                private_key_hex.len()
+            )));
+        }
+        let bytes = hex::decode(private_key_hex).map_err(|_| {
+            ButError::InvalidTransaction("private key hex format sahi nahi hai".to_string())
+        })?;
+        if bytes.len() != 64 {
+            return Err(ButError::InvalidTransaction(
+                "private key 64 bytes ki honi chahiye (128 hex chars)".to_string(),
+            ));
+        }
+        let mut secret_seed = [0u8; 32];
+        secret_seed.copy_from_slice(&bytes[..32]);
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&bytes[32..]);
+        // Public key secret se match karni chahiye — warna key tuti hui hai.
+        let signing_key = SigningKey::from_bytes(&secret_seed);
+        let derived_public = signing_key.verifying_key().to_bytes();
+        if derived_public != public_key {
+            return Err(ButError::InvalidTransaction(
+                "private key ke andar public key secret se match nahi karti — key galat hai".to_string(),
+            ));
+        }
+        let address = address_from_public_key(&public_key);
+        assert_fixed_lengths(&address, private_key_hex)?;
+        Ok(Self {
+            mnemonic: String::new(),
+            secret_seed,
+            public_key,
+            address,
+            private_key_hex: private_key_hex.to_string(),
+        })
+    }
+
     /// Is wallet ka Ed25519 signing key (transaction sign karne ke liye).
     pub fn signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.secret_seed)
@@ -235,5 +280,23 @@ mod tests {
         let pk = public_key_from_private_key_hex(&w.private_key_hex).unwrap();
         assert_eq!(pk, w.public_key);
         assert!(public_key_from_private_key_hex("abcd").is_err());
+    }
+
+    #[test]
+    fn private_key_hex_se_wallet_wapas_banta_hai() {
+        let w = Wallet::generate().unwrap();
+        let w2 = Wallet::from_private_key_hex(&w.private_key_hex).unwrap();
+        assert_eq!(w2.address, w.address);
+        assert_eq!(w2.public_key, w.public_key);
+        assert_eq!(w2.secret_seed, w.secret_seed);
+        // Mnemonic private key se nahi banti — khaali rehti hai.
+        assert!(w2.mnemonic.is_empty());
+        // Galat length reject.
+        assert!(Wallet::from_private_key_hex("abcd").is_err());
+        // Public key badli hui ho to reject (secret se match nahi karegi).
+        let mut bad = w.private_key_hex.clone();
+        let last = bad.pop().unwrap();
+        bad.push(if last == '0' { '1' } else { '0' });
+        assert!(Wallet::from_private_key_hex(&bad).is_err());
     }
 }

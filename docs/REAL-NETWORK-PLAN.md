@@ -143,7 +143,35 @@ wallet hai, demo nahi:
 - **Tokenomics proposal hai** — koi bhi number chain me hardcode nahi hua.
 - **Block reward nahi hai** — validator ko sirf fees milti hain.
 
-## 4. Har demo cheez kab real se replace hogi (replacement plan)
+## 4. Phase 3a me kya REAL hua (7 Nov 2026)
+
+Sanjay ne kaha "Okay start" — Phase 3 shuru. Phase 3a me Rust core ke
+5 kaam hue (koi commit/push nahi — local hi hai):
+
+| Kaam | File | Kya hua |
+|---|---|---|
+| Stake-locking (on-chain) | `chain/src/staking.rs` (naya), `chain/src/chain.rs` | Stake karte hi coins lock hote hain — kharch nahi ho sakte (`balances` map me sirf spendable hai). Lock tiers: 90 din → 180 din → 1 saal → 2 saal → 3 saal → 5 saal (Sanjay ke FINAL, doc §6). Unstake par release 72 ghante me dheere-dheere (linear), ek saath nahi. Lock khatm hone se pehle unstake reject |
+| Released-supply + min-stake | `chain/src/consensus.rs`, `chain/src/chain.rs` | Chain released supply track karti hai (genesis + har block ka reward). Minimum stake = released supply ka 1% (Sanjay ka FINAL). Purana 100 BUT placeholder hata diya. Min stake har block ke saath badhta hai (jaise released 1,025,000 → min 10,250) |
+| BFT-only chain | `chain/src/chain.rs` | Purana PoA `add_block` **hata diya** — ab sirf `add_block_bft` hai: sahi proposer + 2/3 quorum zaroori. Bina votes wala block reject hota hai |
+| Vote gossip | `chain/src/p2p.rs` | Naye messages `AnnounceVote` / `GetVotes` / `Votes`. Validator vote bana kar peers ko bhejta hai; peer verify karke apni tally me rakhta hai; proposer votes maang kar quorum bana sakta hai (`collect_votes_for_block`). Votes block me embedded hote hain — sync karne wala node bhi quorum check karta hai |
+| Block reward + 0.1% team share | `chain/src/consensus.rs`, `chain/src/chain.rs` | Har block par reward mint hota hai: proposer ko 99.9%, team ko 0.1% (Sanjay ka FINAL). Team account genesis me ek baar set hota hai; set na ho to team share `team_accrued` me jama hota hai. **Reward amount PLACEHOLDER hai** — 5 BUT/block + ~4 saal me halving, sirf mechanism ke liye. Sanjay ka FINAL demand-based formula aate hi badlega |
+| Display conversion bits ↔ BUT | `chain/src/units.rs` (naya), `chain/src/api.rs`, `chain/src/main.rs` | 1 BUT = 1,000 bits, integer-only (float nahi). API har balance bits + BUT dono me deti hai; CLI `but-node convert 1500` → `1.5 BUT` |
+
+**Verify (7 Nov 2026):** `cargo test` **104/104 pass** (Phase 2 ke 55 + Phase 3a ke 49 naye: staking 13, units 7, chain 13, p2p 4, api 3, error 1, consensus 8). `cargo run -- demo` verify PASS (6 blocks: transfers + BUT Pay + stake + validator register, reload bhi PASS). `cargo run -- p2p-demo` sync PASS (Node B height 1→3, verify PASS). Live API: `/staking`, `/stake/<addr>`, `/validators` (min stake + released supply), `/balance` (bits + BUT + locked/total) — sab curl se check hue. `npx tsc --noEmit` pass, `npx vitest run` 58/58 pass (web code nahi toota).
+
+**Phase 3a me ek asli bug bhi mila aur theek hua:** `validate_block_against` block ke validator ko `self.validators` (poori chain ki final state) se check karta tha — verify-rebuild me jo validator baad me jail hua ho, uska purana block galat fail hota tha. Ab block se pehle wali state (`validators` parameter) se check hota hai.
+
+**Purani chain files nahi chalengi:** block hash me ab stake op IDs bhi hain — purani `data/chain.json` delete karke `demo` dobara chalao.
+
+### Phase 3a ke baad bhi SIMPLIFIED hai (imaandari se)
+
+- **Block reward placeholder hai** — demand-based formula pending hai (Sanjay ka faisla baki). 5 BUT + halving FINAL nahi hai.
+- **Slashing abhi bhi block-level op nahi hai** — `slash_validator` seedha state badalta hai (sirf tests/admin), uske baad verify fail karega jab tak slash block me darj na ho. Equivocation P2P par sirf log hoti hai, us par slash nahi hota.
+- **BUT Pay registry P2P sync me nahi hai** — sync karte waqt registry khaali hoti hai, ID/handle wale txs wale blocks sync nahi honge.
+- **P2P**: no encryption, no peer discovery, no fork-choice/reorg, no rate limiting — ye sab abhi bhi baaki hai.
+- **API dev-grade hai** — localhost-only, koi auth nahi, HTTPS nahi, mempool disk par save nahi hoti.
+
+## 5. Har demo cheez kab real se replace hogi (replacement plan)
 
 | Demo cheez | Kab replace hogi | Kaise |
 |---|---|---|
@@ -162,28 +190,32 @@ wallet hai, demo nahi:
 
 ---
 
-## 5. Kya abhi bhi REAL NAHI hai (imaandari se list)
+## 6. Kya abhi bhi REAL NAHI hai (imaandari se list)
 
-1. **P2P basic hai, production-grade nahi** — nodes judte hain aur sync karte hain, par encryption, peer discovery, fork-choice/reorg, vote gossip aur rate limiting nahi hain.
-2. **Consensus PoS+BFT machinery hai, poori tarah enforce nahi** — staking, proposer, vote, quorum, slashing bane hain, par slashing sirf bookkeeping hai (stake-locking nahi), aur `add_block` abhi bhi PoA hai (BFT opt-in).
-3. **Web wallet v1 ban gaya hai (7 Nov 2026)** — fake balance, fake transactions, localStorage ledger sab hata diye gaye; UI ab Rust API se juda hai (wiring §3 dekho). Par web wallet abhi bhi **production-grade nahi** — local node par chalta hai, koi audit nahi, biometric real device par test nahi hua, aur UI ko real browser me chalana baaki hai.
-4. **Koi independent security audit nahi hua** — code abhi bina audit ke hai. Asli paisa tabhi aayega jab audit ho.
-5. **Tokenomics PROPOSAL hai, final nahi** — draft likha gaya hai (docs/TOKENOMICS-DRAFT.md), par Sanjay ka final faisla baaki hai. Koi number chain me hardcode nahi hua.
-6. **Android app nahi bani** — skeleton hai, APK nahi. F-Droid tabhi possible hai jab asli app ho.
-7. **Block explorer nahi hai** — transactions dekhne ka koi public tareeka nahi.
-8. **Multi-chain (2–3 chains) abhi nahi hai** — pehle ek chain mazboot hogi, tabhi doosri.
-9. **Device Lock / spend key abhi design hai** — code nahi bana.
-10. **Ye core mainnet-grade nahi hai** — foundation hai. Production se pehle P2P, PoS+BFT, audit, aur testnet chahiye.
+1. **P2P basic hai, production-grade nahi** — nodes judte hain, sync karte hain aur votes gossip karte hain, par encryption, peer discovery, fork-choice/reorg aur rate limiting nahi hain.
+2. **Slashing abhi bhi block-level op nahi hai** — stake-locking, BFT-only chain aur vote gossip Phase 3a me ho gaye, par slashing abhi seedha state badalti hai (verify toot jata hai) aur equivocation par slash nahi hota.
+3. **Block reward placeholder hai** — demand-based formula pending hai (Sanjay ka faisla baki). 5 BUT + halving FINAL nahi.
+4. **Web wallet v1 ban gaya hai (7 Nov 2026)** — fake balance, fake transactions, localStorage ledger sab hata diye gaye; UI ab Rust API se juda hai (wiring §3 dekho). Par web wallet abhi bhi **production-grade nahi** — local node par chalta hai, koi audit nahi, biometric real device par test nahi hua, aur UI ko real browser me chalana baaki hai.
+5. **Koi independent security audit nahi hua** — code abhi bina audit ke hai. Asli paisa tabhi aayega jab audit ho.
+6. **Tokenomics ke kuch faisle abhi pending hain** — demand-based reward formula, baaki 59% allocation, team vesting schedule, BUT Coin reserves/legal (docs/TOKENOMICS-DRAFT.md §8–§10 dekho). Jo FINAL hai wo chain me aa gaya hai (bits, 1B cap, 1% min stake, 0.1% team share, lock tiers).
+7. **Swap feature nahi bana** — liquidity rule (§11) sirf doc me hai, AMM/swap code abhi nahi hai.
+8. **Android app nahi bani** — skeleton hai, APK nahi. F-Droid tabhi possible hai jab asli app ho.
+9. **Block explorer nahi hai** — transactions dekhne ka koi public tareeka nahi.
+10. **Multi-chain (2–3 chains) abhi nahi hai** — pehle ek chain mazboot hogi, tabhi doosri.
+11. **Device Lock / spend key abhi design hai** — code nahi bana.
+12. **Ye core mainnet-grade nahi hai** — foundation hai. Production se pehle P2P, PoS+BFT, audit, aur testnet chahiye.
 
 ---
 
-## 6. Agla step (Phase 3)
+## 7. Agla step (Phase 3b)
 
-1. **Web wallet ko API se jodna** — fake balance/ledger ki jagah asli chain (§3 ki wiring ke hisaab se).
-2. **Stake-locking + block reward** — stake ke coins chain par lock hon, unbonding period, block reward (tokenomics final hone par).
-3. **BFT-only chain** — har block ke liye vote zaroori; P2P par vote gossip.
+Phase 3a ho gaya (stake-locking, BFT-only, vote gossip, reward plumbing, bits↔BUT). Ab:
+
+1. **Swap feature** — §11 liquidity rule ke saath AMM/swap (BUT ↔ BUT Coin, alag-alag liquidity, Bitcoin → BUT → BUT Coin routing).
+2. **Slashing block-level op** — slash aur equivocation block me darj hon, verify na toote.
+3. **BUT Pay registry P2P sync** — ID/handle wale blocks bhi sync hon.
 4. **P2P mazboot karna** — encryption, peer discovery, fork-choice/reorg, rate limiting.
-5. **Tokenomics faisla** — Sanjay se 7 faisle (docs/TOKENOMICS-DRAFT.md §8).
+5. **Tokenomics faisle** — demand-based reward formula, baaki 59% allocation, team vesting schedule, BUT Coin reserves/legal (docs/TOKENOMICS-DRAFT.md §8–§10).
 6. **Testnet** — kai machines par nodes, Red Team / Blue Team testing.
 7. **Independent audit** — production se pehle zaroori.
 

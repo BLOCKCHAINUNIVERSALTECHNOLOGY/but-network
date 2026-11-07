@@ -121,7 +121,18 @@ mod tests {
             &validator.signing_key(),
         )
         .unwrap();
-        chain.add_block(block).unwrap();
+        // BFT se jodo — validator ka self-vote (bootstrap quorum).
+        let mut tally = crate::consensus::VoteTally::new(1);
+        let vote = crate::consensus::Vote::new(
+            block.hash.clone(),
+            1,
+            true,
+            validator.address.clone(),
+            &validator.signing_key(),
+        )
+        .unwrap();
+        tally.add_vote(vote, &chain.validators).unwrap();
+        chain.add_block_bft(block, &tally).unwrap();
 
         let dir = std::env::temp_dir().join("but_chain_test_storage");
         let path = dir.join("chain.json");

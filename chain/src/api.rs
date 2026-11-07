@@ -8,16 +8,35 @@
 //! - `GET /chain/height` — `{"height": N, "latest_hash": "..."}`.
 //! - `GET /chain` — poori chain (blocks ke saath).
 //! - `GET /block/<index>` — ek block, ya 404.
-//! - `GET /balance/<address>` — `{"address", "balance", "nonce"}`.
-//!   Balance hamesha chain state se aata hai. Galat address par 400.
-//! - `GET /mempool` — pending transactions.
-//! - `GET /validators` — validator set (addresses, stake, jail status).
+//! - `GET /balance/<address>` — `{"address", "balance", "balance_but",
+//!   "locked", "locked_but", "unbonding", "claimable", "total", "total_but",
+//!   "nonce"}`. Balance hamesha chain state se aata hai. Galat address par 400.
+//! - `GET /mempool` — pending transactions + pending stake/swap/slash ops.
+//! - `GET /swap/quote/<from>/<to>/<amount>` — swap se PEHLE quote (§11):
+//!   kitna output milega, pool me kitna available hai, Hindi note.
+//!   Amount smallest units me (BUT ke liye bits, BUT Coin ke liye uski
+//!   smallest unit). Jaise `/swap/quote/BUT/BUTCOIN/50000`.
+//! - `GET /swap/pools` — dono pools ki reserves (BUT alag, BUT Coin alag).
+//! - `POST /swap` — signed SwapOp JSON body me bhejo (swap ya liquidity).
+//!   Signature + routing rules verify hokar mempool me jayegi.
+//! - `POST /slash` — signed SlashOp JSON body me bhejo (equivocation ka
+//!   saboot). Saboot verify hokar mempool me jayegi.
+//! - `GET /validators` — validator set (addresses, stake, jail status,
+//!   min_stake, released_supply).
+//! - `GET /staking` — released supply, min stake, locks, unbonding,
+//!   team account/accrued (sab bits aur BUT dono me).
+//! - `GET /stake/<address>` — us address ka lock/unbonding status.
+//! - `POST /stake` — signed StakeOp JSON body me bhejo (stake/unstake/
+//!   claim/register). Signature verify hokar mempool me jayegi.
+//! - `POST /validators/register` — signed Register StakeOp bhejo —
+//!   validator banne ke liye (locked stake >= min stake hona chahiye).
 //! - `POST /tx` — transaction JSON body me bhejo (signature ke saath).
 //!   Signature verify hokar mempool me jayegi. Bina signature ke 400.
 //!   Receiver address ke saath-saath BUT Pay ID (jaise "100001") ya handle
 //!   (jaise "@sanjay") bhi chalega — registry se resolve hota hai.
-//! - `POST /mine` — mempool se block banao aur chain me jodo (dev validator
-//!   se sign hota hai), chain disk par save hoti hai.
+//! - `POST /mine` — mempool se block banao (txs + stake ops + swap ops +
+//!   slash ops) aur BFT se chain me jodo — dev validator proposer hona
+//!   chahiye aur self-vote karta hai. Chain disk par save hoti hai.
 //! - `GET /butpay/<id-ya-handle>` — ID/handle se address nikalo.
 //! - `POST /butpay/register` — naya BUT Pay ID lo: body
 //!   `{"address": "but1...", "handle": "sanjay"}` (handle optional).
@@ -31,7 +50,9 @@
 //! - **Dev validator**: `/mine` fixed demo validator (entropy `[9u8; 32]`)
 //!   se block sign karta hai — wahi validator jo `but-node demo` ki genesis
 //!   me hai. Production me validator key aise hardcode nahi hogi; wo
-//!   secure keystore me hogi.
+//!   secure keystore me hogi. `/mine` tabhi chalta hai jab dev validator
+//!   us height ka proposer ho — doosre validator ke proposer hone par
+//!   `/mine` 400 dega (BFT ka sahi vyavhaar; proposer hi block banata hai).
 //! - **Mempool disk par save nahi hoti**: node band hua to pending
 //!   transactions gayab. Chain disk par save hoti hai, mempool nahi.
 //! - **HTTP, HTTPS nahi**: localhost par theek hai; internet par nahi.
@@ -42,10 +63,15 @@
 use crate::block::Block;
 use crate::butpay::ButPayRegistry;
 use crate::chain::Chain;
+use crate::consensus::{Vote, VoteTally};
 use crate::error::{ButError, Result};
 use crate::mempool::Mempool;
+use crate::slash::SlashOp;
+use crate::staking::StakeOp;
 use crate::storage::{butpay_path_for, load_chain_with_registry, save_butpay, save_chain};
+use crate::swap::{format_butcoin, SwapAsset, SwapOp};
 use crate::transaction::Transaction;
+use crate::units::{format_but, format_but_with_unit};
 use crate::wallet::{validate_address, Wallet};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -113,32 +139,95 @@ impl ApiState {
         Ok(id)
     }
 
-    /// Mempool se block mine karo: block banao, chain me jodo, disk par save karo.
+    /// Signed StakeOp mempool me dalo (signature + format verify hota hai).
+    pub fn submit_stake_op(&self, op: StakeOp) -> Result<String> {
+        let op_id = op.id();
+        let mut pool = self.mempool.lock().unwrap();
+        pool.add_stake_op(op)?;
+        Ok(op_id)
+    }
+
+    /// Signed SwapOp mempool me dalo (signature + format + routing rules
+    /// verify hote hain). Balance/pool ki final checking block apply karte
+    /// waqt hoti hai.
+    pub fn submit_swap_op(&self, op: SwapOp) -> Result<String> {
+        let op_id = op.id();
+        let mut pool = self.mempool.lock().unwrap();
+        pool.add_swap_op(op)?;
+        Ok(op_id)
+    }
+
+    /// Signed SlashOp mempool me dalo (saboot + signature verify hote hain).
+    /// Nonce aur dedup ki final checking block apply karte waqt hoti hai.
+    pub fn submit_slash_op(&self, op: SlashOp) -> Result<String> {
+        let op_id = op.id();
+        let mut pool = self.mempool.lock().unwrap();
+        pool.add_slash_op(op)?;
+        Ok(op_id)
+    }
+
+    /// Mempool se block mine karo: block banao (txs + stake ops + swap ops
+    /// + slash ops), BFT se chain me jodo, disk par save karo.
+    /// Dev validator us height ka proposer hona chahiye — warna 400.
+    /// Self-vote karta hai (bootstrap quorum jab stake 0 ho, ya apna hissa).
     pub fn mine(&self) -> Result<Block> {
-        let txs = {
+        let (txs, stake_ops, swap_ops, slash_ops) = {
             let mut pool = self.mempool.lock().unwrap();
-            pool.take_for_block(10)
+            (
+                pool.take_for_block(10),
+                pool.take_stake_ops_for_block(10),
+                pool.take_swap_ops_for_block(10),
+                pool.take_slash_ops_for_block(10),
+            )
         };
-        if txs.is_empty() {
+        if txs.is_empty() && stake_ops.is_empty() && swap_ops.is_empty() && slash_ops.is_empty() {
             return Err(ButError::InvalidTransaction(
-                "mempool khaali hai — mine karne ko koi transaction nahi hai".to_string(),
+                "mempool khaali hai — mine karne ko koi transaction ya op nahi hai".to_string(),
             ));
         }
-        let block = {
+        let (block, tally) = {
             let chain = self.chain.lock().unwrap();
-            Block::new(
-                chain.height() as u64,
+            let height = chain.height() as u64;
+            // Proposer check — dev validator hi proposer hona chahiye.
+            match chain.validators.proposer_for_round(height) {
+                Some(p) if p == self.validator.address => {}
+                Some(p) => {
+                    return Err(ButError::InvalidVote(format!(
+                        "is height ka proposer {p} hai, dev validator nahi — /mine sirf proposer chala sakta hai"
+                    )));
+                }
+                None => {
+                    return Err(ButError::InvalidVote(
+                        "koi active validator nahi hai — proposer nahi chuna ja sakta".to_string(),
+                    ));
+                }
+            }
+            let block = Block::new_with_ops(
+                height,
                 now_secs(),
                 chain.latest_hash(),
                 txs,
+                stake_ops,
+                swap_ops,
+                slash_ops,
                 self.validator.address.clone(),
                 &self.validator.signing_key(),
-            )?
+            )?;
+            let mut tally = VoteTally::new(height);
+            let vote = Vote::new(
+                block.hash.clone(),
+                height,
+                true,
+                self.validator.address.clone(),
+                &self.validator.signing_key(),
+            )?;
+            tally.add_vote(vote, &chain.validators)?;
+            (block, tally)
         };
         {
             let mut chain = self.chain.lock().unwrap();
             let reg = self.butpay.lock().unwrap();
-            chain.add_block_with_registry(block.clone(), &reg)?;
+            chain.add_block_bft_with_registry(block.clone(), &tally, &reg)?;
             save_chain(&chain, &self.chain_path)?;
             save_butpay(&butpay_path_for(&self.chain_path), &reg)?;
         }
@@ -234,7 +323,7 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
                 200,
                 json!({
                     "ok": true,
-                    "node": "but-node (Phase 2 local API)",
+                    "node": "but-node (Phase 3b local API)",
                     "height": height,
                     "latest_hash": latest_hash,
                     "endpoints": [
@@ -244,8 +333,16 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
                         "GET /balance/<address>",
                         "GET /mempool",
                         "GET /validators",
+                        "GET /staking",
+                        "GET /stake/<address>",
+                        "POST /stake",
+                        "POST /validators/register",
                         "GET /butpay/<id-ya-handle>",
                         "POST /butpay/register",
+                        "GET /swap/quote/<from>/<to>/<amount>",
+                        "GET /swap/pools",
+                        "POST /swap",
+                        "POST /slash",
                         "POST /tx",
                         "POST /mine",
                     ],
@@ -268,9 +365,90 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
         }
         ("GET", "/mempool") => {
             let pool = state.mempool.lock().unwrap();
-            match serde_json::to_value(pool.list()) {
-                Ok(v) => (200, json!({"ok": true, "pending": v})),
-                Err(e) => (500, json!({"ok": false, "error": format!("mempool JSON nahi bana: {e}")})),
+            match (
+                serde_json::to_value(pool.list()),
+                serde_json::to_value(pool.stake_ops()),
+                serde_json::to_value(pool.swap_ops()),
+                serde_json::to_value(pool.slash_ops()),
+            ) {
+                (Ok(txs), Ok(stake_ops), Ok(swap_ops), Ok(slash_ops)) => (
+                    200,
+                    json!({"ok": true, "pending": txs, "stake_ops": stake_ops, "swap_ops": swap_ops, "slash_ops": slash_ops}),
+                ),
+                _ => (500, json!({"ok": false, "error": "mempool JSON nahi bana"})),
+            }
+        }
+        ("GET", "/swap/pools") => {
+            let chain = state.chain.lock().unwrap();
+            let swap = &chain.swap;
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "but_pool": swap.but_pool,
+                    "but_pool_but": format_but(swap.but_pool),
+                    "butcoin_pool": swap.butcoin_pool,
+                    "butcoin_pool_coins": format_butcoin(swap.butcoin_pool),
+                    "note": "Dono pools alag hain — BUT ka pool aur BUT Coin ka pool kabhi mix nahi hote (§13). Swap sirf available liquidity tak hota hai (§11).",
+                }),
+            )
+        }
+        ("GET", p) if p.starts_with("/swap/quote/") => {
+            // /swap/quote/<from>/<to>/<amount> — amount smallest units me.
+            let rest = &p["/swap/quote/".len()..];
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() != 3 {
+                return (
+                    400,
+                    json!({"ok": false, "error": "quote URL aisi honi chahiye: /swap/quote/BUT/BUTCOIN/50000"}),
+                );
+            }
+            let (from_s, to_s, amount_s) = (parts[0], parts[1], parts[2]);
+            let amount: u64 = match amount_s.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    return (
+                        400,
+                        json!({"ok": false, "error": format!("amount number hona chahiye, mila: {amount_s}")}),
+                    )
+                }
+            };
+            let (from, to) = match (SwapAsset::parse(from_s), SwapAsset::parse(to_s)) {
+                (Ok(f), Ok(t)) => (f, t),
+                (Err(e), _) | (_, Err(e)) => {
+                    return (400, json!({"ok": false, "error": e.to_string()}));
+                }
+            };
+            let chain = state.chain.lock().unwrap();
+            match chain.swap.quote(&from, &to, amount) {
+                Ok(quote) => (200, json!({"ok": true, "quote": quote})),
+                Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+            }
+        }
+        ("POST", "/swap") => {
+            let op: std::result::Result<SwapOp, _> = serde_json::from_slice(body);
+            match op {
+                Ok(op) => match state.submit_swap_op(op) {
+                    Ok(op_id) => (200, json!({"ok": true, "op_id": op_id})),
+                    Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+                },
+                Err(e) => (
+                    400,
+                    json!({"ok": false, "error": format!("swap op JSON samajh nahi aaya: {e}")}),
+                ),
+            }
+        }
+        ("POST", "/slash") => {
+            let op: std::result::Result<SlashOp, _> = serde_json::from_slice(body);
+            match op {
+                Ok(op) => match state.submit_slash_op(op) {
+                    Ok(op_id) => (200, json!({"ok": true, "op_id": op_id})),
+                    Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+                },
+                Err(e) => (
+                    400,
+                    json!({"ok": false, "error": format!("slash op JSON samajh nahi aaya: {e}")}),
+                ),
             }
         }
         ("GET", "/validators") => {
@@ -284,8 +462,123 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
                     "stakes": vs.stakes,
                     "jailed": vs.jailed,
                     "total_active_stake": vs.total_active_stake(),
+                    "min_stake": chain.min_stake(),
+                    "min_stake_but": format_but(chain.min_stake()),
+                    "released_supply": chain.released_supply(),
+                    "released_supply_but": format_but(chain.released_supply()),
                 }),
             )
+        }
+        ("GET", "/staking") => {
+            let chain = state.chain.lock().unwrap();
+            let locks: Vec<Value> = chain
+                .staking
+                .locks
+                .iter()
+                .map(|(addr, lock)| {
+                    json!({
+                        "address": addr,
+                        "locked": lock.amount,
+                        "locked_but": format_but(lock.amount),
+                        "tier_days": lock.tier.lock_seconds() / 86_400,
+                        "locked_at": lock.locked_at,
+                        "unlock_at": lock.unlock_at(),
+                    })
+                })
+                .collect();
+            let unbonding: Vec<Value> = chain
+                .staking
+                .unbonding
+                .iter()
+                .map(|u| {
+                    json!({
+                        "staker": u.staker,
+                        "total": u.total_amount,
+                        "released": u.released_amount,
+                        "remaining": u.total_amount - u.released_amount,
+                        "started_at": u.started_at,
+                    })
+                })
+                .collect();
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "released_supply": chain.released_supply(),
+                    "released_supply_but": format_but(chain.released_supply()),
+                    "min_stake": chain.min_stake(),
+                    "min_stake_but": format_but(chain.min_stake()),
+                    "min_stake_percent": 1,
+                    "team_account": chain.team_account,
+                    "team_accrued": chain.team_accrued,
+                    "team_accrued_but": format_but(chain.team_accrued),
+                    "next_block_reward": chain.next_block_reward(),
+                    "next_block_reward_but": format_but(chain.next_block_reward()),
+                    "locks": locks,
+                    "unbonding": unbonding,
+                }),
+            )
+        }
+        ("GET", p) if p.starts_with("/stake/") => {
+            let address = &p["/stake/".len()..];
+            match validate_address(address) {
+                Ok(()) => {
+                    let chain = state.chain.lock().unwrap();
+                    let lock = chain.staking.locks.get(address);
+                    let claimable = chain.claimable_balance(address, now_secs());
+                    (
+                        200,
+                        json!({
+                            "ok": true,
+                            "address": address,
+                            "locked": chain.locked_balance(address),
+                            "locked_but": format_but(chain.locked_balance(address)),
+                            "tier_days": lock.map(|l| l.tier.lock_seconds() / 86_400),
+                            "unlock_at": lock.map(|l| l.unlock_at()),
+                            "unbonding": chain.unbonding_balance(address),
+                            "unbonding_but": format_but(chain.unbonding_balance(address)),
+                            "claimable": claimable,
+                            "claimable_but": format_but(claimable),
+                            "min_stake": chain.min_stake(),
+                        }),
+                    )
+                }
+                Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+            }
+        }
+        ("POST", "/stake") => {
+            let op: std::result::Result<StakeOp, _> = serde_json::from_slice(body);
+            match op {
+                Ok(op) => match state.submit_stake_op(op) {
+                    Ok(op_id) => (200, json!({"ok": true, "op_id": op_id})),
+                    Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+                },
+                Err(e) => (
+                    400,
+                    json!({"ok": false, "error": format!("stake op JSON samajh nahi aaya: {e}")}),
+                ),
+            }
+        }
+        ("POST", "/validators/register") => {
+            let op: std::result::Result<StakeOp, _> = serde_json::from_slice(body);
+            match op {
+                Ok(op) => {
+                    if op.kind != crate::staking::StakeOpKind::Register {
+                        return (
+                            400,
+                            json!({"ok": false, "error": "is endpoint par sirf Register op chalega"}),
+                        );
+                    }
+                    match state.submit_stake_op(op) {
+                        Ok(op_id) => (200, json!({"ok": true, "op_id": op_id})),
+                        Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+                    }
+                }
+                Err(e) => (
+                    400,
+                    json!({"ok": false, "error": format!("register op JSON samajh nahi aaya: {e}")}),
+                ),
+            }
         }
         ("POST", "/tx") => {
             let tx: std::result::Result<Transaction, _> = serde_json::from_slice(body);
@@ -372,12 +665,29 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
             match validate_address(address) {
                 Ok(()) => {
                     let chain = state.chain.lock().unwrap();
+                    let balance = chain.balance(address);
+                    let butcoin = chain.butcoin_balance(address);
+                    let locked = chain.locked_balance(address);
+                    let unbonding = chain.unbonding_balance(address);
+                    let total = chain.total_balance(address);
                     (
                         200,
                         json!({
                             "ok": true,
                             "address": address,
-                            "balance": chain.balance(address),
+                            "balance": balance,
+                            "balance_but": format_but(balance),
+                            "balance_display": format_but_with_unit(balance),
+                            "butcoin_balance": butcoin,
+                            "butcoin_balance_coins": format_butcoin(butcoin),
+                            "locked": locked,
+                            "locked_but": format_but(locked),
+                            "unbonding": unbonding,
+                            "unbonding_but": format_but(unbonding),
+                            "claimable": chain.claimable_balance(address, now_secs()),
+                            "claimable_but": format_but(chain.claimable_balance(address, now_secs())),
+                            "total": total,
+                            "total_but": format_but(total),
                             "nonce": chain.next_nonce(address),
                         }),
                     )
@@ -485,8 +795,12 @@ mod tests {
     use std::io::Read;
 
     fn test_state() -> ApiState {
-        // Temp dir me chain file — test ke baad saaf hoti hai.
-        let dir = std::env::temp_dir().join("but_api_test_state");
+        // Har test ko apna alag temp dir — warna parallel tests ek hi
+        // chain.json par ladte hain aur flaky fail hote hain.
+        static COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("but_api_test_state_{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("chain.json");
         ApiState::load_or_create(&path).unwrap()
@@ -650,6 +964,265 @@ mod tests {
         let r2 = http_raw(port, "GET /chain/height HTTP/1.1\r\nHost: x\r\nOrigin: http://localhost:5173\r\nConnection: close\r\n\r\n");
         assert!(r2.starts_with("HTTP/1.1 200 OK"), "height 200: {r2}");
         assert!(r2.contains("Access-Control-Allow-Origin: *"), "GET jawab me CORS header: {r2}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stake_endpoint_aur_staking_status() {
+        use crate::staking::{LockTier, StakeOp};
+        let state = test_state();
+        let alice = Wallet::from_entropy(&[1u8; 32]).unwrap();
+        // Alice 100,000 bits stake karti hai (tier 90 din), nonce 0.
+        let mut op = StakeOp::stake(alice.address.clone(), 100_000, LockTier::Days90, 0);
+        op.sign(&alice.signing_key()).unwrap();
+        let op_json = serde_json::to_string(&op).unwrap();
+        let (port, handle) = serve_test_api(&state, 5);
+        // 1. POST /stake — mempool me jayega.
+        let req = format!(
+            "POST /stake HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            op_json.len(),
+            op_json
+        );
+        let r1 = http_raw(port, &req);
+        assert!(r1.starts_with("HTTP/1.1 200 OK"), "stake submit fail: {r1}");
+        assert!(body_of(&r1).contains("\"ok\":true"));
+        // 2. POST /mine — stake op block me jayega.
+        let r2 = http_raw(port, "POST /mine HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(r2.starts_with("HTTP/1.1 200 OK"), "mine fail: {r2}");
+        // 3. GET /stake/<alice> — locked 100,000 dikhna chahiye.
+        let req3 = format!(
+            "GET /stake/{} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            alice.address
+        );
+        let r3 = http_raw(port, &req3);
+        assert!(r3.starts_with("HTTP/1.1 200 OK"), "stake status fail: {r3}");
+        assert!(body_of(&r3).contains("\"locked\":100000"), "locked: {}", body_of(&r3));
+        // format_but trailing zeros hatata hai: 100,000 bits = "100" BUT.
+        assert!(body_of(&r3).contains("\"locked_but\":\"100\""), "locked_but: {}", body_of(&r3));
+        // 4. GET /balance/<alice> — spendable 900,000, total 1,000,000.
+        let req4 = format!(
+            "GET /balance/{} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            alice.address
+        );
+        let r4 = http_raw(port, &req4);
+        assert!(body_of(&r4).contains("\"balance\":900000"), "balance: {}", body_of(&r4));
+        assert!(body_of(&r4).contains("\"total\":1000000"), "total: {}", body_of(&r4));
+        // 5. GET /staking — 1 block mine hua: released 1,005,000,
+        // min stake uska 1% = 10,050.
+        let r5 = http_raw(port, "GET /staking HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r5.starts_with("HTTP/1.1 200 OK"), "staking fail: {r5}");
+        assert!(body_of(&r5).contains("\"min_stake\":10050"), "min_stake: {}", body_of(&r5));
+        assert!(body_of(&r5).contains("\"released_supply\":1005000"), "released: {}", body_of(&r5));
+        assert!(body_of(&r5).contains("\"team_accrued\":5"), "team_accrued: {}", body_of(&r5));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn bina_signature_stake_op_aur_galat_register_reject() {
+        use crate::staking::{LockTier, StakeOp};
+        let state = test_state();
+        let alice = Wallet::from_entropy(&[1u8; 32]).unwrap();
+        // Bina signature wali stake op.
+        let op = StakeOp::stake(alice.address.clone(), 10_000, LockTier::Days90, 0);
+        let op_json = serde_json::to_string(&op).unwrap();
+        let (port, handle) = serve_test_api(&state, 2);
+        let req = format!(
+            "POST /stake HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            op_json.len(),
+            op_json
+        );
+        let r1 = http_raw(port, &req);
+        assert!(r1.starts_with("HTTP/1.1 400"), "unsigned stake op 400 honi chahiye: {r1}");
+        // /validators/register par Stake op (Register nahi) — 400.
+        let mut op2 = StakeOp::stake(alice.address.clone(), 10_000, LockTier::Days90, 0);
+        op2.sign(&alice.signing_key()).unwrap();
+        let op2_json = serde_json::to_string(&op2).unwrap();
+        let req2 = format!(
+            "POST /validators/register HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            op2_json.len(),
+            op2_json
+        );
+        let r2 = http_raw(port, &req2);
+        assert!(r2.starts_with("HTTP/1.1 400"), "galat kind register par 400: {r2}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn validators_endpoint_me_min_stake_aur_released_supply() {
+        let state = test_state();
+        let (port, handle) = serve_test_api(&state, 1);
+        let r1 = http_raw(port, "GET /validators HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r1.starts_with("HTTP/1.1 200 OK"), "validators fail: {r1}");
+        assert!(body_of(&r1).contains("\"min_stake\":10000"), "min_stake: {}", body_of(&r1));
+        assert!(body_of(&r1).contains("\"released_supply\":1000000"), "released: {}", body_of(&r1));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn swap_quote_pools_swap_mine_flow() {
+        use crate::swap::{SwapAsset, SwapOp};
+        // Custom genesis: Alice ko BUT + BUT Coin dono, Bob ko BUT.
+        let validator = dev_validator();
+        let alice = Wallet::from_entropy(&[1u8; 32]).unwrap();
+        let bob = Wallet::from_entropy(&[2u8; 32]).unwrap();
+        let dir = std::env::temp_dir().join("but_api_test_swap_flow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let chain = Chain::new_genesis_full(
+            vec![
+                (alice.address.clone(), 1_000_000),
+                (bob.address.clone(), 500_000),
+            ],
+            vec![(alice.address.clone(), 1_000_000)],
+            &validator,
+            now_secs(),
+            None,
+        )
+        .unwrap();
+        let state = ApiState {
+            chain: Arc::new(Mutex::new(chain)),
+            mempool: Arc::new(Mutex::new(Mempool::new())),
+            chain_path: dir.join("chain.json"),
+            butpay: Arc::new(Mutex::new(ButPayRegistry::new())),
+            validator,
+        };
+        let (port, handle) = serve_test_api(&state, 9);
+        // 1. GET /swap/pools — shuru me dono khaali.
+        let r1 = http_raw(port, "GET /swap/pools HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r1.starts_with("HTTP/1.1 200 OK"), "pools fail: {r1}");
+        assert!(body_of(&r1).contains("\"but_pool\":0"));
+        assert!(body_of(&r1).contains("\"butcoin_pool\":0"));
+        // 2. POST /swap — Alice BUT liquidity 100,000 (nonce 0).
+        let mut liq_but = SwapOp::add_liquidity(SwapAsset::But, 100_000, 0, alice.address.clone());
+        liq_but.sign(&alice.signing_key()).unwrap();
+        let liq_but_json = serde_json::to_string(&liq_but).unwrap();
+        let req2 = format!(
+            "POST /swap HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            liq_but_json.len(),
+            liq_but_json
+        );
+        let r2 = http_raw(port, &req2);
+        assert!(r2.starts_with("HTTP/1.1 200 OK"), "liquidity BUT fail: {r2}");
+        // 3. POST /swap — Alice BUT Coin liquidity 500,000 (nonce 1).
+        let mut liq_coin =
+            SwapOp::add_liquidity(SwapAsset::ButCoin, 500_000, 1, alice.address.clone());
+        liq_coin.sign(&alice.signing_key()).unwrap();
+        let liq_coin_json = serde_json::to_string(&liq_coin).unwrap();
+        let req3 = format!(
+            "POST /swap HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            liq_coin_json.len(),
+            liq_coin_json
+        );
+        let r3 = http_raw(port, &req3);
+        assert!(r3.starts_with("HTTP/1.1 200 OK"), "liquidity BUT Coin fail: {r3}");
+        // 4. POST /mine — dono liquidity ops block me jayenge.
+        let r4 = http_raw(port, "POST /mine HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(r4.starts_with("HTTP/1.1 200 OK"), "mine fail: {r4}");
+        // 5. GET /swap/quote/BUT/BUTCOIN/50000 — out 166,666 hona chahiye.
+        let r5 = http_raw(port, "GET /swap/quote/BUT/BUTCOIN/50000 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r5.starts_with("HTTP/1.1 200 OK"), "quote fail: {r5}");
+        assert!(body_of(&r5).contains("\"expected_out\":166666"), "quote: {}", body_of(&r5));
+        assert!(body_of(&r5).contains("\"available_out\":500000"), "available: {}", body_of(&r5));
+        // 6. POST /swap — Bob 50,000 BUT → BUT Coin (nonce 0).
+        let mut sw = SwapOp::swap(
+            SwapAsset::But,
+            SwapAsset::ButCoin,
+            50_000,
+            0,
+            bob.address.clone(),
+        );
+        sw.sign(&bob.signing_key()).unwrap();
+        let sw_json = serde_json::to_string(&sw).unwrap();
+        let req6 = format!(
+            "POST /swap HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sw_json.len(),
+            sw_json
+        );
+        let r6 = http_raw(port, &req6);
+        assert!(r6.starts_with("HTTP/1.1 200 OK"), "swap fail: {r6}");
+        // 7. POST /mine — swap block me jayega.
+        let r7 = http_raw(port, "POST /mine HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(r7.starts_with("HTTP/1.1 200 OK"), "mine 2 fail: {r7}");
+        // 8. GET /balance/<bob> — BUT Coin 166,666 milna chahiye.
+        let req8 = format!(
+            "GET /balance/{} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            bob.address
+        );
+        let r8 = http_raw(port, &req8);
+        assert!(body_of(&r8).contains("\"butcoin_balance\":166666"), "bob butcoin: {}", body_of(&r8));
+        // 9. GET /swap/pools — BUT 150,000, BUT Coin 333,334.
+        let r9 = http_raw(port, "GET /swap/pools HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(body_of(&r9).contains("\"but_pool\":150000"), "pool but: {}", body_of(&r9));
+        assert!(body_of(&r9).contains("\"butcoin_pool\":333334"), "pool coin: {}", body_of(&r9));
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_quote_btc_se_butcoin_reject_aur_slash_submit() {
+        use crate::consensus::Vote;
+        use crate::slash::SlashOp;
+        use crate::swap::{SwapAsset, SwapOp};
+        let state = test_state();
+        let alice = Wallet::from_entropy(&[1u8; 32]).unwrap();
+        let bob = Wallet::from_entropy(&[2u8; 32]).unwrap();
+        let (port, handle) = serve_test_api(&state, 3);
+        // 1. GET /swap/quote/BTC/BUTCOIN/1000 — §14 routing reject (400).
+        let r1 = http_raw(port, "GET /swap/quote/BTC/BUTCOIN/1000 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r1.starts_with("HTTP/1.1 400"), "BTC quote 400 honi chahiye: {r1}");
+        assert!(body_of(&r1).contains("BTC"));
+        // 2. POST /swap — BTC → BUT Coin op bhi reject (400).
+        let mut bad = SwapOp::swap(
+            SwapAsset::External("BTC".to_string()),
+            SwapAsset::ButCoin,
+            1_000,
+            0,
+            alice.address.clone(),
+        );
+        bad.sign(&alice.signing_key()).unwrap();
+        let bad_json = serde_json::to_string(&bad).unwrap();
+        let req2 = format!(
+            "POST /swap HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            bad_json.len(),
+            bad_json
+        );
+        let r2 = http_raw(port, &req2);
+        assert!(r2.starts_with("HTTP/1.1 400"), "BTC swap 400 hona chahiye: {r2}");
+        // 3. POST /slash — Alice ke khilaf equivocation saboot (Bob reporter).
+        let v1 = Vote::new(
+            "a".repeat(64),
+            3,
+            true,
+            alice.address.clone(),
+            &alice.signing_key(),
+        )
+        .unwrap();
+        let v2 = Vote::new(
+            "b".repeat(64),
+            3,
+            true,
+            alice.address.clone(),
+            &alice.signing_key(),
+        )
+        .unwrap();
+        let mut slash = SlashOp::new(
+            alice.address.clone(),
+            v1,
+            v2,
+            "equivocation height 3".to_string(),
+            bob.address.clone(),
+            0,
+        );
+        slash.sign(&bob.signing_key()).unwrap();
+        let slash_json = serde_json::to_string(&slash).unwrap();
+        let req3 = format!(
+            "POST /slash HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            slash_json.len(),
+            slash_json
+        );
+        let r3 = http_raw(port, &req3);
+        assert!(r3.starts_with("HTTP/1.1 200 OK"), "slash submit fail: {r3}");
+        assert!(body_of(&r3).contains("\"ok\":true"));
         handle.join().unwrap();
     }
 
