@@ -7,10 +7,11 @@
  * ZAROORI SACH — pehle padho:
  * - Ye module is demo ko asli wallet ya production blockchain NAHI banata.
  * - Isse bana wallet SIRF DEMO hai. Isme asli paisa kabhi mat rakho.
- * - Mnemonic yahan "BIP39-style" hai, real BIP39 NAHI hai. Real BIP39 me
- *   2048 words ki official list hoti hai (11 bit per word). Yahan demo ke
- *   liye 256 words ki list hai (8 bit per word). Real BIP39 ke liye vetted
- *   library (jaise `bip39`) aur independent security audit chahiye.
+ * - Mnemonic ab REAL BIP39 hai: 24 words, official 2048-word English list
+ *   (shared/bip39-wordlist.ts, source: bitcoin/bips). Lekin implementation
+ *   haath se likha hai — vetted `bip39` library use NAHI hui, kyunki npm
+ *   install fail hua (project pnpm-managed hai, pnpm is machine par nahi
+ *   hai). Production se pehle vetted library + independent audit CHAHIYE.
  * - Slow unlock (2 minute) brute-force ko mehenga banata hai, par ye
  *   wallet ko "unbreakable" NAHI banata. Kamzor password (jaise "123456")
  *   phir bhi dictionary attack se toot jayega. Strong, unique password
@@ -21,6 +22,22 @@
  *   Web demo me encrypted vault localStorage me rehta hai — ye hardware
  *   storage NAHI hai. Slow KDF yahan uski kami ko thoda kam karta hai.
  *
+ * 1024-BIT WALI BAAT — SAHI SAMAJH:
+ * - "1024-bit wallet" agar RSA-1024 matlab hai to wo GALAT raasta hai.
+ *   NIST ke hisaab se RSA-1024 sirf ~80-bit security deta hai, deprecated
+ *   hai aur disallowed hai. 256-bit ECC (Ed25519) lagbhag 3072-bit RSA ke
+ *   barabar hai (~128-bit security) — matlab chhoti key, zyada suraksha.
+ *   Isliye BUT Ed25519 (256-bit) use karta hai, RSA-1024 NAHI.
+ * - Private key 128 characters ki hai = 64 bytes stored data (32-byte
+ *   seed + 32-byte public key). Iska matlab "1024-bit security" NAHI hai —
+ *   asli secret 256-bit hai. Bada number likhna suraksha nahi badhata.
+ *
+ * FIXED LENGTH SPEC (Sanjay ka faisla — na isse kam, na isse zyada):
+ * - Seed phrase: bilkul 24 words (real BIP39).
+ * - Private key: bilkul 128 characters (hex, 64 bytes).
+ * - Wallet address: bilkul 56 characters ("but1" + 52 hex characters).
+ * - Galat length wallet reject karega — neeche validation functions dekho.
+ *
  * Security rules (kabhi mat todo):
  * - Random ke liye sirf CSPRNG (crypto.getRandomValues). Math.random
  *   kabhi key, seed ya password ke liye use mat karo.
@@ -29,6 +46,10 @@
  *   Password sirf user ki memory me aur unlock ke waqt RAM me rehta hai.
  */
 
+import { BIP39_WORDLIST } from "./bip39-wordlist";
+
+/** BIP39 official English wordlist (2048 words) — bahar se bhi use ho sake. */
+export { BIP39_WORDLIST };
 import {
   decryptFromLocalStorage,
   encryptForLocalStorage,
@@ -38,47 +59,28 @@ import {
 } from "./crypto-secure";
 
 // ---------------------------------------------------------------------------
-// 0. Demo wordlist (256 words) — real BIP39 list NAHI hai
-//    256 words = 8 bit per word. 32 bytes entropy + 1 checksum byte
-//    = 33 words. Real BIP39: 2048 words, 11 bit per word.
+// 0. Fixed-length spec — Sanjay ka faisla (na kam, na zyada)
 // ---------------------------------------------------------------------------
 
-export const DEMO_WORDLIST: readonly string[] = [
-  "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
-  "absurd", "accent", "accept", "access", "accident", "account", "accuse", "achieve",
-  "acid", "acoustic", "acquire", "across", "action", "actor", "actress", "actual",
-  "adapt", "add", "addict", "address", "adjust", "admit", "adult", "advance",
-  "advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent",
-  "agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album",
-  "alcohol", "alert", "alien", "align", "alike", "alive", "all", "alley",
-  "allow", "almost", "alone", "alpha", "already", "also", "alter", "always",
-  "amateur", "amazing", "among", "amount", "amused", "analyst", "anchor", "ancient",
-  "anger", "angle", "angry", "animal", "ankle", "announce", "annual", "another",
-  "answer", "antenna", "antique", "anxiety", "any", "apart", "apology", "appear",
-  "apple", "approve", "april", "arch", "arctic", "area", "arena", "argue",
-  "arm", "armed", "armor", "army", "around", "arrange", "arrest", "arrive",
-  "arrow", "art", "artefact", "artist", "artwork", "ask", "aspect", "assault",
-  "asset", "assist", "assume", "asthma", "athlete", "atom", "attack", "attend",
-  "attitude", "attract", "auction", "audit", "august", "aunt", "author", "auto",
-  "autumn", "average", "avocado", "avoid", "awake", "aware", "away", "awesome",
-  "awful", "axis", "baby", "bachelor", "bacon", "badge", "bag", "balance",
-  "balcony", "ball", "bamboo", "banana", "banner", "bar", "barely", "bargain",
-  "barrel", "base", "basic", "basket", "battle", "beach", "bean", "beauty",
-  "become", "beef", "before", "begin", "behave", "behind", "believe", "below",
-  "belt", "bench", "benefit", "best", "betray", "better", "between", "beyond",
-  "bicycle", "bid", "bike", "bind", "biology", "bird", "birth", "bitter",
-  "black", "blade", "blame", "blanket", "blast", "bleak", "bless", "blind",
-  "blood", "blossom", "blouse", "blue", "blur", "blush", "board", "boat",
-  "body", "boil", "bomb", "bone", "bonus", "book", "boost", "border",
-  "boring", "borrow", "boss", "bottom", "bounce", "box", "boy", "bracket",
-  "brain", "brand", "brass", "brave", "bread", "breeze", "brick", "bridge",
-  "brief", "bright", "bring", "brisk", "broccoli", "broken", "bronze", "broom",
-  "brother", "brown", "brush", "bubble", "buddy", "budget", "buffalo", "build",
-  "bulb", "bulk", "bullet", "bundle", "bunker", "burden", "burger", "burst",
-  "bus", "business", "busy", "butter", "buyer", "buzz", "cabbage", "cabin",
-];
+/** Seed phrase hamesha bilkul 24 words ki hogi (real BIP39). */
+export const MNEMONIC_WORD_COUNT = 24;
 
-const WORD_INDEX = new Map(DEMO_WORDLIST.map((w, i) => [w, i]));
+/** Private key hamesha bilkul 128 characters ki hogi (hex, 64 bytes). */
+export const PRIVATE_KEY_LENGTH = 128;
+
+/** Wallet address hamesha bilkul 56 characters ka hoga. */
+export const ADDRESS_LENGTH = 56;
+
+/** Address hamesha "but1" se shuru hoga, uske baad 52 hex characters. */
+export const ADDRESS_PREFIX = "but1";
+
+/** BIP39 entropy: 24 words ke liye 256 bit (32 bytes). */
+const BIP39_ENTROPY_BYTES = 32;
+
+/** BIP39 checksum: entropy ke har 32 bit par 1 bit = 8 bit. */
+const BIP39_CHECKSUM_BITS = 8;
+
+const WORD_INDEX = new Map(BIP39_WORDLIST.map((w, i) => [w, i]));
 
 /** Wallet password kam se kam 12 akshar ka hona chahiye. */
 export const MIN_WALLET_PASSWORD_LENGTH = 12;
@@ -120,48 +122,148 @@ function base64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
-// ---------------------------------------------------------------------------
-// 1. Mnemonic (BIP39-style, real BIP39 NAHI hai — upar padho)
-// ---------------------------------------------------------------------------
-
-/**
- * Secure entropy se mnemonic banao. Default 32 bytes entropy + 1 checksum
- * byte = 33 words. Entropy hamesha CSPRNG se aati hai.
- */
-export async function generateMnemonic(entropyBytes = 32): Promise<string> {
-  if (entropyBytes !== 16 && entropyBytes !== 32) {
-    throw new Error("Entropy 16 ya 32 bytes ki honi chahiye.");
-  }
-  const entropy = secureRandomBytes(entropyBytes);
-  const checksumHex = await sha256Hex(entropy);
-  const checksumByte = Number.parseInt(checksumHex.slice(0, 2), 16);
-  const bytes = new Uint8Array(entropy.length + 1);
-  bytes.set(entropy, 0);
-  bytes[entropy.length] = checksumByte;
-  return Array.from(bytes, (b) => DEMO_WORDLIST[b]).join(" ");
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Mnemonic sahi hai ya nahi — words, length aur checksum check karo. */
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+async function sha256Bytes(data: Uint8Array): Promise<Uint8Array> {
+  const digest = await getCrypto().subtle.digest(
+    "SHA-256",
+    data as BufferSource,
+  );
+  return new Uint8Array(digest);
+}
+
+// ---------------------------------------------------------------------------
+// 1. Fixed-length validation — galat length reject hogi
+// ---------------------------------------------------------------------------
+
+/** Private key sahi format me hai? Bilkul 128 hex characters. */
+export function isValidPrivateKeyFormat(privateKeyHex: unknown): boolean {
+  return (
+    typeof privateKeyHex === "string" &&
+    privateKeyHex.length === PRIVATE_KEY_LENGTH &&
+    /^[0-9a-f]{128}$/.test(privateKeyHex)
+  );
+}
+
+/** Address sahi format me hai? Bilkul 56 characters, "but1" + 52 hex. */
+export function isValidAddress(address: unknown): boolean {
+  return (
+    typeof address === "string" &&
+    address.length === ADDRESS_LENGTH &&
+    address.startsWith(ADDRESS_PREFIX) &&
+    /^[0-9a-f]{52}$/.test(address.slice(ADDRESS_PREFIX.length))
+  );
+}
+
+/**
+ * Wallet ki fixed lengths check karo. Galat ho to Hindi error ke saath
+ * throw karo. Har wallet banane / kholne se pehle ye check chalti hai.
+ */
+export function assertFixedLengths(
+  address: unknown,
+  privateKeyHex: unknown,
+): void {
+  if (!isValidAddress(address)) {
+    throw new Error(
+      `Address bilkul ${ADDRESS_LENGTH} characters ka hona chahiye ("but1" + 52 hex characters).`,
+    );
+  }
+  if (!isValidPrivateKeyFormat(privateKeyHex)) {
+    throw new Error(
+      `Private key bilkul ${PRIVATE_KEY_LENGTH} characters ki honi chahiye (hex).`,
+    );
+  }
+}
+
+/**
+ * 128-character private key ko kholo: pehle 64 characters = 32-byte seed,
+ * aakhri 64 characters = 32-byte public key. Format galat ho to error.
+ */
+export function parsePrivateKeyHex(privateKeyHex: string): {
+  seed: Uint8Array;
+  publicKey: Uint8Array;
+} {
+  if (!isValidPrivateKeyFormat(privateKeyHex)) {
+    throw new Error(
+      `Private key bilkul ${PRIVATE_KEY_LENGTH} characters ki honi chahiye (hex).`,
+    );
+  }
+  return {
+    seed: hexToBytes(privateKeyHex.slice(0, 64)),
+    publicKey: hexToBytes(privateKeyHex.slice(64)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 2. Mnemonic — REAL BIP39, bilkul 24 words
+//    32 bytes entropy + 8-bit checksum = 264 bits = 24 x 11-bit words.
+// ---------------------------------------------------------------------------
+
+function bitsToWords(bits: number[]): string {
+  const words: string[] = [];
+  for (let i = 0; i < bits.length; i += 11) {
+    let index = 0;
+    for (let j = 0; j < 11; j++) {
+      index = (index << 1) | bits[i + j];
+    }
+    words.push(BIP39_WORDLIST[index]);
+  }
+  return words.join(" ");
+}
+
+/**
+ * Secure entropy (32 bytes, CSPRNG) se real BIP39 mnemonic banao.
+ * Hamesha bilkul 24 words. Entropy hamesha CSPRNG se aati hai.
+ */
+export async function generateMnemonic(): Promise<string> {
+  const entropy = secureRandomBytes(BIP39_ENTROPY_BYTES);
+  const checksum = await sha256Bytes(entropy);
+  // 256 entropy bits + checksum ke pehle 8 bits = 264 bits.
+  const bits: number[] = [];
+  for (const byte of entropy) {
+    for (let i = 7; i >= 0; i--) bits.push((byte >> i) & 1);
+  }
+  for (let i = 7; i >= 0; i--) bits.push((checksum[0] >> i) & 1);
+  return bitsToWords(bits);
+}
+
+/** Mnemonic sahi hai ya nahi — bilkul 24 words, list, aur checksum check. */
 export async function validateMnemonic(mnemonic: string): Promise<boolean> {
   if (typeof mnemonic !== "string") return false;
   const words = mnemonic.trim().split(/\s+/);
-  if (words.length !== 17 && words.length !== 33) return false;
-  const bytes: number[] = [];
+  if (words.length !== MNEMONIC_WORD_COUNT) return false;
+  const bits: number[] = [];
   for (const word of words) {
     const index = WORD_INDEX.get(word);
     if (index === undefined) return false;
-    bytes.push(index);
+    for (let i = 10; i >= 0; i--) bits.push((index >> i) & 1);
   }
-  const entropy = new Uint8Array(bytes.slice(0, -1));
-  const checksumHex = await sha256Hex(entropy);
-  const expected = Number.parseInt(checksumHex.slice(0, 2), 16);
-  return bytes[bytes.length - 1] === expected;
+  // Pehle 256 bits = entropy, aakhri 8 bits = checksum.
+  const entropy = new Uint8Array(BIP39_ENTROPY_BYTES);
+  for (let i = 0; i < 256; i++) {
+    if (bits[i] === 1) entropy[Math.floor(i / 8)] |= 1 << (7 - (i % 8));
+  }
+  const checksum = await sha256Bytes(entropy);
+  for (let i = 0; i < BIP39_CHECKSUM_BITS; i++) {
+    if (bits[256 + i] !== ((checksum[0] >> (7 - i)) & 1)) return false;
+  }
+  return true;
 }
 
 /**
- * Mnemonic se seed banao (BIP39 jaisa: PBKDF2-SHA-512, 2048 iterations,
- * 64 bytes). Salt me "but-mnemonic" prefix hai — ye real BIP39 ka
- * "mnemonic" salt NAHI hai, isliye seed real BIP39 wallet se alag hoga.
+ * Mnemonic se seed banao — REAL BIP39: PBKDF2-HMAC-SHA-512, salt
+ * "mnemonic" + passphrase, 2048 iterations, 64 bytes. Ye seed dusre
+ * BIP39 wallet se bhi same hoga (agar passphrase same ho).
  */
 export async function mnemonicToSeed(
   mnemonic: string,
@@ -181,7 +283,7 @@ export async function mnemonicToSeed(
   const bits = await cryptoObj.subtle.deriveBits(
     {
       name: "PBKDF2",
-      salt: new TextEncoder().encode(`but-mnemonic${passphrase}`),
+      salt: new TextEncoder().encode(`mnemonic${passphrase}`),
       iterations: 2048,
       hash: "SHA-512",
     },
@@ -192,19 +294,23 @@ export async function mnemonicToSeed(
 }
 
 // ---------------------------------------------------------------------------
-// 2. Wallet banana: keypair + mnemonic + address
+// 3. Wallet banana: keypair + mnemonic + address (fixed lengths)
 // ---------------------------------------------------------------------------
 
 export type DemoWallet = {
-  /** Address: "but1" + SHA-256(public key) ke pehle 20 bytes (hex). */
+  /** Address: bilkul 56 characters — "but1" + SHA-256(public key) ke pehle 26 bytes (hex). */
   address: string;
   /** Public key, base64 (SPKI). Share karna safe hai. */
   publicKeyBase64: string;
-  /** Private key, base64 (PKCS8). Kabhi share mat karo, kabhi plain mat rakho. */
-  privateKeyBase64: string;
-  /** Kaunsa algorithm: "Ed25519" ya fallback "ECDSA P-256". */
+  /**
+   * Private key, bilkul 128 hex characters = 64 bytes:
+   * pehle 32 bytes seed + aakhri 32 bytes public key.
+   * Kabhi share mat karo, kabhi plain mat rakho.
+   */
+  privateKeyHex: string;
+  /** Kaunsa algorithm: hamesha "Ed25519" (fixed-length wallet ke liye). */
   algorithm: string;
-  /** Mnemonic (33 words). Sirf ek baar dikhao, user ko likhne ko kaho, phir kabhi store mat karo. */
+  /** Mnemonic (bilkul 24 words, real BIP39). Sirf ek baar dikhao, user ko likhne ko kaho, phir kabhi store mat karo. */
   mnemonic: string;
   warning: string;
 };
@@ -212,17 +318,65 @@ export type DemoWallet = {
 const WALLET_WARNING =
   "DEMO WALLET — Ye sirf demo ke liye hai. Isme asli paisa kabhi mat rakho. Mnemonic aur private key ko kisi ko mat dikhao.";
 
-/** Naya demo wallet banao: CSPRNG se mnemonic + keypair, address SHA-256 se. */
+/** Ed25519 SPKI DER ka shuruwaati hissa (12 bytes), uske baad 32-byte public key. */
+const ED25519_SPKI_PREFIX = [
+  0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/** Ed25519 PKCS8 DER ka shuruwaati hissa (16 bytes), uske baad 32-byte seed. */
+const ED25519_PKCS8_PREFIX = [
+  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+  0x04, 0x22, 0x04, 0x20,
+];
+
+function extractEd25519RawKey(
+  derBase64: string,
+  prefix: number[],
+  label: string,
+): Uint8Array {
+  const der = base64ToBytes(derBase64);
+  if (der.length !== prefix.length + 32) {
+    throw new Error(`${label} ka format sahi nahi hai (Ed25519 chahiye).`);
+  }
+  for (let i = 0; i < prefix.length; i++) {
+    if (der[i] !== prefix[i]) {
+      throw new Error(`${label} ka format sahi nahi hai (Ed25519 chahiye).`);
+    }
+  }
+  return der.slice(prefix.length);
+}
+
+/**
+ * Naya demo wallet banao: CSPRNG se 24-word BIP39 mnemonic + Ed25519
+ * keypair, address SHA-256 se (bilkul 56 characters). Private key bilkul
+ * 128 hex characters ki hogi. Fixed lengths check karke hi return hoga.
+ */
 export async function generateWallet(): Promise<DemoWallet> {
   const keypair = await generateDemoKeypair();
-  const mnemonic = await generateMnemonic(32);
-  const publicKeyBytes = base64ToBytes(keypair.publicKeyBase64);
-  const addressHash = await sha256Hex(publicKeyBytes);
-  const address = `but1${addressHash.slice(0, 40)}`;
+  if (keypair.algorithm !== "Ed25519") {
+    throw new Error(
+      "Fixed-length wallet ke liye Ed25519 chahiye — is device par Ed25519 available nahi hai.",
+    );
+  }
+  const publicKeyRaw = extractEd25519RawKey(
+    keypair.publicKeyBase64,
+    ED25519_SPKI_PREFIX,
+    "Public key",
+  );
+  const seedRaw = extractEd25519RawKey(
+    keypair.privateKeyBase64,
+    ED25519_PKCS8_PREFIX,
+    "Private key",
+  );
+  const privateKeyHex = bytesToHex(seedRaw) + bytesToHex(publicKeyRaw);
+  const addressHash = await sha256Hex(publicKeyRaw);
+  const address = `${ADDRESS_PREFIX}${addressHash.slice(0, 52)}`;
+  const mnemonic = await generateMnemonic();
+  assertFixedLengths(address, privateKeyHex);
   return {
     address,
     publicKeyBase64: keypair.publicKeyBase64,
-    privateKeyBase64: keypair.privateKeyBase64,
+    privateKeyHex,
     algorithm: keypair.algorithm,
     mnemonic,
     warning: WALLET_WARNING,
@@ -230,7 +384,7 @@ export async function generateWallet(): Promise<DemoWallet> {
 }
 
 // ---------------------------------------------------------------------------
-// 3. KDF: fast / slow / test — password se AES-GCM key banana
+// 4. KDF: fast / slow / test — password se AES-GCM key banana
 // ---------------------------------------------------------------------------
 
 export type KdfMode = "fast" | "slow" | "test";
@@ -362,20 +516,22 @@ export async function deriveWalletKey(
 }
 
 // ---------------------------------------------------------------------------
-// 4. Wallet vault: private key ko encrypt karke store karo
+// 5. Wallet vault: private key ko encrypt karke store karo
 //    Mnemonic yahan store NAHI hota — user ko ek baar dikhao, likhwao,
 //    phir bhool jao. Vault me sirf keypair + address rehta hai.
+//    Payload v3 hai — purana v2 demo vault isse NAHI khulega (demo only).
 // ---------------------------------------------------------------------------
 
 export type WalletVault = {
   address: string;
   publicKeyBase64: string;
-  privateKeyBase64: string;
+  /** Private key, bilkul 128 hex characters. */
+  privateKeyHex: string;
   algorithm: string;
 };
 
 export type EncryptedWalletPayload = {
-  v: 2;
+  v: 3;
   kdf: "PBKDF2-SHA-256";
   mode: KdfMode;
   iterations: number;
@@ -398,6 +554,7 @@ function bytesToBase64(bytes: Uint8Array): string {
  * Wallet vault ko password se encrypt karo. Fast mode roz ke use ke liye
  * hai. Slow mode unlock/lock me ~2 minute lagata hai — brute-force ko
  * mehenga banane ke liye. Galat password par decrypt fail hoga.
+ * Encrypt karne se pehle fixed lengths check hoti hain.
  */
 export async function encryptWalletVault(
   vault: WalletVault,
@@ -406,9 +563,10 @@ export async function encryptWalletVault(
   targetMs: number = SLOW_UNLOCK_TARGET_MS,
 ): Promise<string> {
   assertStrongPassword(password);
-  if (!vault.address || !vault.privateKeyBase64 || !vault.publicKeyBase64) {
+  if (!vault.address || !vault.privateKeyHex || !vault.publicKeyBase64) {
     throw new Error("Vault me address aur keys honi chahiye.");
   }
+  assertFixedLengths(vault.address, vault.privateKeyHex);
   const cryptoObj = getCrypto();
   const salt = secureRandomBytes(16);
   const iv = secureRandomBytes(12);
@@ -419,7 +577,7 @@ export async function encryptWalletVault(
     new TextEncoder().encode(JSON.stringify(vault)),
   );
   const payload: EncryptedWalletPayload = {
-    v: 2,
+    v: 3,
     kdf: "PBKDF2-SHA-256",
     mode,
     iterations: derived.iterations,
@@ -433,7 +591,8 @@ export async function encryptWalletVault(
 /**
  * Encrypted wallet vault ko password se kholo. Slow mode se lock kiya
  * hoga to unlock me bhi utna hi time lagega. Galat password ya badla
- * hua data hoga to error aayega — vault nahi khulega.
+ * hua data hoga to error aayega — vault nahi khulega. Khulne ke baad
+ * fixed lengths phir se check hoti hain.
  */
 export async function decryptWalletVault(
   payloadJson: string,
@@ -448,7 +607,7 @@ export async function decryptWalletVault(
     throw new Error("Vault sahi format me nahi hai.");
   }
   if (
-    payload.v !== 2 ||
+    payload.v !== 3 ||
     payload.kdf !== "PBKDF2-SHA-256" ||
     (payload.mode !== "fast" && payload.mode !== "slow" && payload.mode !== "test") ||
     !Number.isInteger(payload.iterations) ||
@@ -478,9 +637,10 @@ export async function decryptWalletVault(
     throw new Error("Vault nahi khula. Galat password ya data badla gaya hai.");
   }
   const vault = JSON.parse(new TextDecoder().decode(decrypted)) as WalletVault;
-  if (!vault.address || !vault.privateKeyBase64 || !vault.publicKeyBase64) {
+  if (!vault.address || !vault.privateKeyHex || !vault.publicKeyBase64) {
     throw new Error("Vault ka data sahi nahi hai.");
   }
+  assertFixedLengths(vault.address, vault.privateKeyHex);
   return vault;
 }
 

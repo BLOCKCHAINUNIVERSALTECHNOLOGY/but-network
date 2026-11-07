@@ -1,0 +1,7 @@
+BUT Wallet is a demo wallet for the BUT Network.
+
+Your keys stay in the phone's secure hardware (Android Keystore) and
+never leave the device. An optional Device Lock allows transactions
+only from your registered phone.
+
+This is a demo. Do not put real money in it.

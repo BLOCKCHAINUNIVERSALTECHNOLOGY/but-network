@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BUT Wallet (Demo)</string>
+    <string name="demo_warning">Demo hai — isme asli paisa kabhi mat rakho.</string>
+    <string name="status_not_created">Device key: abhi nahi bani</string>
+    <string name="create_wallet">Naya wallet banao</string>
+    <string name="sign_test">Sign test karo</string>
+</resources>

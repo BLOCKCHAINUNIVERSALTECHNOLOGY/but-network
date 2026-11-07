@@ -1,0 +1,1 @@
+BUT Wallet demo — device-locked, hardware-backed wallet.
