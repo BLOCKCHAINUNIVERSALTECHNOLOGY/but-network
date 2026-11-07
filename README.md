@@ -31,7 +31,7 @@ Cold Mode सिर्फ स्क्रीन पर विवरण छिप
 
 **नया — demo wallet module:** `shared/wallet-secure.ts` में demo wallet banta hai — mnemonic (BIP39-style, real BIP39 नहीं), Ed25519 keypair, `but1` address, aur slow unlock (~2 minute, brute-force ko mehenga banane ke liye)। Slow unlock ka matlab unbreakable नहीं है — kamzor password phir भी टूट जाएगा।
 
-**F-Droid:** F-Droid par launch ke liye checklist dekho — `docs/FDROID-CHECKLIST.md`। Abhi Android app nahi hai aur LICENSE bhi nahi hai, isliye F-Droid launch abhi possible nahi hai। License ka draft hai — `LICENSE-DRAFT-MIT.txt` (sirf draft, Sanjay ke faisle ke baad hi LICENSE banega)।
+**F-Droid:** F-Droid par launch ke liye checklist dekho — `docs/FDROID-CHECKLIST.md`। License taiyar hai — project Apache License 2.0 ke under hai (`LICENSE` dekho)। Abhi Android app nahi hai, isliye F-Droid launch abhi possible nahi hai।
 
 ## ब्लॉक डेटा का आकार
 
@@ -39,4 +39,4 @@ Lossless compression bytes को कम जगह में रखता है
 
 ## लाइसेंस
 
-रिपॉज़िटरी की सार्वजनिक उपलब्धता का अर्थ अपने-आप यह नहीं कि कोड को किसी भी शर्त पर दोबारा इस्तेमाल या वितरित करने की अनुमति है। रिपॉज़िटरी में अलग लाइसेंस चुने जाने तक, लागू अधिकारों/शर्तों के लिए repository owner से पूछें।
+Ye project **Apache License 2.0** ke under licensed hai — poora text `LICENSE` file me dekho। Copyright 2026 Bharat Unified Technology (Sanjay Nain)।

@@ -19,6 +19,8 @@
 | Cheez | Status |
 |---|---|
 | Source code public hai (GitHub) | ✅ Taiyar |
+| LICENSE file hai (Apache-2.0) | ✅ Taiyar |
+| package.json me license field hai (Apache-2.0) | ✅ Taiyar |
 | SECURITY.md hai | ✅ Taiyar |
 | Secure random (CSPRNG) — `Math.random` key ke liye nahi | ✅ Taiyar |
 | Wallet encryption (AES-256-GCM + PBKDF2, slow unlock option) | ✅ Taiyar (demo) |
@@ -31,9 +33,7 @@
 | Cheez | Kya chahiye |
 |---|---|
 | **Android app nahi hai** | Asli Android app banana hoga (Kotlin, Android Studio). Web demo ko APK me badalna kaafi nahi hai. |
-| **LICENSE file nahi hai** | License chunna hoga — MIT / Apache-2.0 / GPL me se ek. Abhi README me likha hai "owner se puchho" — F-Droid ise accept nahi karega. Draft taiyar hai: `LICENSE-DRAFT-MIT.txt` dekho. LICENSE lagane se pehle Sanjay ka faisla chahiye. |
 | **Stable App ID nahi hai** | Android app ka fixed ID chahiye, jaise `in.bharatunifiedtechnology.butwallet`. Ek baar publish hone ke baad ID badla nahi jata. |
-| **package.json me license field nahi hai** | License chunne ke baad package.json me license field bhi bharna hoga. |
 | **AWS S3 dependency check karni hai** | `@aws-sdk/client-s3` library Apache-2.0 hai (FOSS), par S3 ek proprietary service hai. Agar app ko S3 chahiye to F-Droid "NonFreeNet" anti-feature laga sakta hai. Decide karna hoga: S3 hataye ya optional rakhe. |
 | **Google Maps types** | `@types/google.maps` sirf type definitions hain (dev time), runtime tracker nahi hai. Phir bhi Android app me Google Maps use mat karna — OpenStreetMap use karna. |
 | **Reproducible build** | Best practice hai, zaroori nahi hai. F-Droid khud source se build karta hai. Build steps ko document karna hoga. |
@@ -52,8 +52,7 @@
 
 ## 4. Agle steps (Next steps, order me)
 
-1. **Sanjay license chune** — MIT (sabse simple) ya Apache-2.0 ya GPL.
-   Draft: `LICENSE-DRAFT-MIT.txt`. Faisle ke baad use `LICENSE` naam se add karenge.
+1. ✅ **License chun liya — Apache-2.0** — `LICENSE` file add ho gayi hai, README aur package.json bhi update hain।
 2. **Asli Android app banaye** — Kotlin me, stable App ID ke saath.
 3. **Hardware wallet storage** — Android Keystore + EncryptedSharedPreferences.
 4. **S3 dependency ka faisla** — hataye ya optional rakhe.

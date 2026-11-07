@@ -1,6 +1,7 @@
 {
   "name": "butwallet",
   "version": "1.0.0",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "NODE_ENV=development tsx watch server/_core/index.ts",
