@@ -21,6 +21,12 @@ BUT के Hot Mode, Cold Mode और ब्लॉक-डेटा स्टो�
 
 Cold Mode सिर्फ स्क्रीन पर विवरण छिपाता है। यह क्रिप्टोग्राफ़िक गोपनीयता नहीं देता और डेमो डेटा ब्राउज़र के local storage में पढ़ा जा सकता है। इसमें असली निजी जानकारी, seed phrase, वॉलेट कुंजी या असली कॉइन न डालें। असली प्राइवेसी नेटवर्क के लिए सावधानीपूर्वक प्रोटोकॉल डिज़ाइन, स्वतंत्र सुरक्षा ऑडिट और लागू कानूनी आवश्यकताओं की समीक्षा चाहिए। यह prototype निवेश, भुगतान या production उपयोग के लिए नहीं है।
 
+पूरी सुरक्षा नीति के लिए `SECURITY.md` पढ़ें। उसमें लिखा है कि ये डेमो क्या है और क्या नहीं है, क्या नहीं डालना है, और कोई कमज़ोरी मिले तो उसे private तरीके से कैसे report करें।
+
+**नया secure module:** `shared/crypto-secure.ts` में अब सही CSPRNG random, SHA-256 hash, demo keypair और AES-GCM encryption (password से key बनाकर) है। Demo transaction ID अब `Math.random()` की जगह secure random से बनता है।
+
+**साफ़ चेतावनी:** इस module के होने से ये डेमो अब भी असली blockchain या production wallet नहीं बनता। Demo data अभी भी localStorage में plain JSON के रूप में save होता है; encrypt करके save करने के लिए module में `saveEncryptedDemoData()` / `loadEncryptedDemoData()` तैयार हैं, उन्हें Home.tsx से जोड़ना अगला कदम है।
+
 ## ब्लॉक डेटा का आकार
 
 Lossless compression bytes को कम जगह में रखता है, लेकिन इतिहास मिटाता नहीं है। Pruning के बाद कोई नोड अपनी स्थानीय कॉपी से पुराने ब्लॉक विवरण हटा सकता है; नेटवर्क के archive nodes इतिहास उपलब्ध रख सकते हैं। Snapshot नए नोड को वर्तमान state से sync करने में मदद कर सकता है, पर अपने-आप हर पुराना transaction उपलब्ध नहीं कराता। Hash या state commitment हटाए गए bytes को वापस नहीं बना सकता। ऐप का यह अनुभाग शैक्षिक है और किसी वास्तविक नेटवर्क के आँकड़े नहीं दिखाता।

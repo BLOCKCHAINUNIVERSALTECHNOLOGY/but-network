@@ -95,8 +95,16 @@ function currentTime() {
   }).format(new Date());
 }
 
+// SECURITY FIX: Pehle yahan Math.random() use hota tha. Math.random()
+// security ke liye safe nahi hai, isliye ab crypto.getRandomValues()
+// (CSPRNG) use kar rahe hain. Ye sirf demo transaction ID ke liye hai,
+// ye koi asli key ya asli hash nahi hai.
 function randomDemoId() {
-  return Math.random().toString(16).slice(2, 10).toUpperCase();
+  const bytes = new Uint8Array(4);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
 }
 
 function maskAddress(address: string) {
