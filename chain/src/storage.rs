@@ -8,6 +8,7 @@
 use crate::butpay::ButPayRegistry;
 use crate::chain::Chain;
 use crate::error::{ButError, Result};
+use crate::faucet::Faucet;
 use std::fs;
 use std::path::Path;
 
@@ -90,6 +91,56 @@ pub fn butpay_path_for(chain_path: &Path) -> std::path::PathBuf {
     match chain_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join("butpay.json"),
         _ => std::path::PathBuf::from("butpay.json"),
+    }
+}
+
+/// Faucet state save karo — file `data/faucet.json`
+/// (chain file ke saath wahi directory me). Pehle temp file me likho,
+/// phir rename karo — crash hone par bhi file aadhi nahi likhi jayegi.
+/// Rate limit isi file par tiki hai — file delete hui to claims bhool
+/// jayenge, isliye is file ko chain file jaisa hi sambhal kar rakho.
+pub fn save_faucet(path: &Path, faucet: &Faucet) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let json = serde_json::to_string_pretty(faucet)
+        .map_err(|e| ButError::Storage(format!("faucet JSON me nahi badla: {e}")))?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, &json)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Faucet state load karo. File na mile to **band** faucet milta hai
+/// (safe default — normal chain par faucet nahi chalta). File mili
+/// lekin data kharab hua to error — galat state se faucet nahi chalega.
+pub fn load_faucet(path: &Path) -> Result<Faucet> {
+    match fs::read_to_string(path) {
+        Ok(json) => {
+            let faucet: Faucet = serde_json::from_str(&json).map_err(|e| {
+                ButError::Storage(format!(
+                    "faucet file '{}' ka data kharab hai — JSON parse nahi hua: {e}",
+                    path.display()
+                ))
+            })?;
+            Ok(faucet)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Faucet::disabled()),
+        Err(e) => Err(ButError::Storage(format!(
+            "faucet file '{}' padhi nahi gayi: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Chain file ke path se faucet file ka path banao.
+/// Jaise `data/chain.json` → `data/faucet.json`.
+pub fn faucet_path_for(chain_path: &Path) -> std::path::PathBuf {
+    match chain_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("faucet.json"),
+        _ => std::path::PathBuf::from("faucet.json"),
     }
 }
 
@@ -194,6 +245,31 @@ mod tests {
         // File na ho to khaali registry milti hai, error nahi.
         let missing = load_butpay(&dir.join("nahi-hai.json")).unwrap();
         assert_eq!(missing.len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn faucet_save_load_roundtrip() {
+        use crate::faucet::{Faucet, DEFAULT_DRIP_BITS};
+        let alice = Wallet::from_entropy(&[1u8; 32]).unwrap();
+        let bob = Wallet::from_entropy(&[2u8; 32]).unwrap();
+        let mut faucet = Faucet::new_testnet();
+        faucet.record_claim(&alice.address, "1.2.3.4", 1_700_000_000, DEFAULT_DRIP_BITS);
+        faucet.record_claim(&bob.address, "1.2.3.4", 1_700_000_100, DEFAULT_DRIP_BITS);
+        let dir = std::env::temp_dir().join("but_chain_test_faucet");
+        let chain_path = dir.join("chain.json");
+        let faucet_path = faucet_path_for(&chain_path);
+        assert_eq!(faucet_path, dir.join("faucet.json"));
+        save_faucet(&faucet_path, &faucet).unwrap();
+        let loaded = load_faucet(&faucet_path).unwrap();
+        assert!(loaded.config.enabled);
+        assert_eq!(loaded.total_claims, 2);
+        assert_eq!(loaded.total_dripped_bits, 2 * DEFAULT_DRIP_BITS);
+        // Restart ke baad bhi rate limit yaad rehti hai — Alice dobara nahi le sakti.
+        assert!(loaded.can_claim(&alice.address, "1.2.3.4", 1_700_000_200).is_err());
+        // File na ho to BAND faucet milta hai (safe default), error nahi.
+        let missing = load_faucet(&dir.join("nahi-hai.json")).unwrap();
+        assert!(!missing.config.enabled);
         let _ = fs::remove_dir_all(&dir);
     }
 }

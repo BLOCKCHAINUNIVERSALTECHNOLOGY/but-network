@@ -41,12 +41,21 @@
 //! - `POST /butpay/register` — naya BUT Pay ID lo: body
 //!   `{"address": "but1...", "handle": "sanjay"}` (handle optional).
 //!   Jawab: `{"ok": true, "id": 100001, "address": ..., "handle": ...}`.
+//! - `POST /faucet` — **sirf testnet mode me**: body
+//!   `{"address": "but1..."}` — 1,000 BUT test coins ki signed transaction
+//!   mempool me jati hai; coins agle block mine hone par milte hain.
+//!   Ek address din me 1 baar, ek IP se din me 10 alag addresses.
+//! - `GET /faucet/status` — faucet chal raha hai ya nahi, drip kitni hai,
+//!   kul kitna diya gaya, faucet wallet ka balance.
 //!
 //! SACH BATA RAHE HAIN — kya abhi bhi simplified hai:
 //! - **Localhost only, koi auth nahi**: ye API sirf apni machine par chalane
 //!   ke liye hai. Is par koi password/API-key nahi hai — internet par khula
 //!   chhoda to koi bhi transaction bhej sakta hai (galat tx waise bhi
 //!   signature check par reject hogi, par spam ho sakta hai).
+//! - **Faucet sirf testnet par**: normal node (`load_or_create`) par faucet
+//!   band rehta hai; testnet node (`load_or_create_testnet` / `but-node
+//!   testnet`) par hi chalta hai. Faucet ke test coins ki koi real value nahi.
 //! - **Dev validator**: `/mine` fixed demo validator (entropy `[9u8; 32]`)
 //!   se block sign karta hai — wahi validator jo `but-node demo` ki genesis
 //!   me hai. Production me validator key aise hardcode nahi hogi; wo
@@ -65,10 +74,14 @@ use crate::butpay::ButPayRegistry;
 use crate::chain::Chain;
 use crate::consensus::{Vote, VoteTally};
 use crate::error::{ButError, Result};
+use crate::faucet::{faucet_wallet, Faucet, TESTNET_FAUCET_FUND_BITS};
 use crate::mempool::Mempool;
 use crate::slash::SlashOp;
 use crate::staking::StakeOp;
-use crate::storage::{butpay_path_for, load_chain_with_registry, save_butpay, save_chain};
+use crate::storage::{
+    butpay_path_for, faucet_path_for, load_chain_with_registry, load_faucet, save_butpay,
+    save_chain, save_faucet,
+};
 use crate::swap::{format_butcoin, SwapAsset, SwapOp};
 use crate::transaction::Transaction;
 use crate::units::{format_but, format_but_with_unit};
@@ -100,11 +113,19 @@ pub struct ApiState {
     pub butpay: Arc<Mutex<ButPayRegistry>>,
     /// Block mine karne wala validator wallet.
     pub validator: Wallet,
+    /// Testnet faucet — claims aur rate limit. Disk par `faucet.json`
+    /// (chain file ke saath) me save hoti hai. Normal node par band rehti hai.
+    pub faucet: Arc<Mutex<Faucet>>,
+    /// Faucet ka wallet — test coins dene wala. Sirf testnet mode me set
+    /// hota hai; normal node par None (faucet band).
+    pub faucet_wallet: Option<Wallet>,
 }
 
 impl ApiState {
     /// Chain file load karo; file na ho to demo genesis banao aur save karo.
     /// BUT Pay registry bhi saath me load/save hoti hai.
+    /// **Faucet is node par BAND rehta hai** — ye normal (mainnet jaisa)
+    /// node hai; testnet ke liye `load_or_create_testnet` use karo.
     pub fn load_or_create(chain_path: &Path) -> Result<Self> {
         let validator = dev_validator();
         let (chain, butpay) = if chain_path.exists() {
@@ -127,6 +148,132 @@ impl ApiState {
             chain_path: chain_path.to_path_buf(),
             butpay: Arc::new(Mutex::new(butpay)),
             validator,
+            faucet: Arc::new(Mutex::new(Faucet::disabled())),
+            faucet_wallet: None,
+        })
+    }
+
+    /// Testnet node ke liye chain load karo (ya testnet genesis banao).
+    /// Testnet genesis me faucet wallet ko test coins fund hote hain
+    /// (100,000,000 BUT — sirf test coins, koi real value nahi) aur
+    /// faucet ON rehta hai. File pehle se ho to chain + faucet state
+    /// dono load hote hain; faucet file na ho (purani non-testnet chain)
+    /// to faucet band rahega — testnet genesis se hi faucet chalta hai.
+    pub fn load_or_create_testnet(chain_path: &Path) -> Result<Self> {
+        let validator = dev_validator();
+        let faucet_w = faucet_wallet();
+        let (chain, butpay, faucet) = if chain_path.exists() {
+            let (chain, butpay) = load_chain_with_registry(chain_path)?;
+            let faucet = load_faucet(&faucet_path_for(chain_path))?;
+            (chain, butpay, faucet)
+        } else {
+            let alice = Wallet::from_entropy(&[1u8; 32]).unwrap();
+            let chain = Chain::new_genesis(
+                vec![
+                    (alice.address.clone(), 1_000_000),
+                    (faucet_w.address.clone(), TESTNET_FAUCET_FUND_BITS),
+                ],
+                &validator,
+                now_secs(),
+            )?;
+            save_chain(&chain, chain_path)?;
+            let butpay = ButPayRegistry::new();
+            save_butpay(&butpay_path_for(chain_path), &butpay)?;
+            let faucet = Faucet::new_testnet();
+            save_faucet(&faucet_path_for(chain_path), &faucet)?;
+            (chain, butpay, faucet)
+        };
+        Ok(Self {
+            chain: Arc::new(Mutex::new(chain)),
+            mempool: Arc::new(Mutex::new(Mempool::new())),
+            chain_path: chain_path.to_path_buf(),
+            butpay: Arc::new(Mutex::new(butpay)),
+            validator,
+            faucet: Arc::new(Mutex::new(faucet)),
+            faucet_wallet: Some(faucet_w),
+        })
+    }
+
+    /// Faucet se test coins do — sirf testnet mode me.
+    /// Asli signed transaction faucet wallet se mempool me jati hai; coins
+    /// agle block mine hone par (POST /mine) milte hain.
+    /// Poori drip ek faucet lock ke andar hoti hai — do requests ek saath
+    /// aaye to bhi nonce aur rate limit sahi rahe (nonce me mempool me
+    /// pending faucet txs bhi gine jate hain).
+    /// Jawab: (transaction ID, drip amount bits).
+    pub fn faucet_drip(&self, address: &str, client_ip: &str) -> Result<(String, u64)> {
+        let now = now_secs();
+        let faucet_w = match &self.faucet_wallet {
+            Some(w) => w.clone(),
+            None => {
+                return Err(ButError::InvalidTransaction(
+                    "is node par faucet wallet set nahi hai — faucet sirf testnet node par chalta hai (`but-node testnet`)"
+                        .to_string(),
+                ))
+            }
+        };
+        let mut faucet = self.faucet.lock().unwrap();
+        faucet.can_claim(address, client_ip, now)?;
+        let drip = faucet.config.drip_amount_bits;
+        // Faucet wallet ka balance + agla nonce. Mempool me pending faucet
+        // txs ko bhi gino — warna do drip ek hi nonce lekar block fail kar denge.
+        let (balance, nonce) = {
+            let chain = self.chain.lock().unwrap();
+            let pending = self
+                .mempool
+                .lock()
+                .unwrap()
+                .list()
+                .iter()
+                .filter(|t| t.sender == faucet_w.address)
+                .count() as u64;
+            (
+                chain.balance(&faucet_w.address),
+                chain.next_nonce(&faucet_w.address) + pending,
+            )
+        };
+        if balance < drip {
+            return Err(ButError::InvalidTransaction(format!(
+                "faucet wallet me test coins khatm ho gaye — balance {balance} bits, drip {drip} bits chahiye. Testnet genesis dobara banao."
+            )));
+        }
+        let mut tx = Transaction::new(faucet_w.address.clone(), address.to_string(), drip, 0, nonce);
+        tx.sign(&faucet_w.signing_key())?;
+        let tx_id = tx.id();
+        {
+            let mut pool = self.mempool.lock().unwrap();
+            pool.add(tx)?;
+        }
+        faucet.record_claim(address, client_ip, now, drip);
+        save_faucet(&faucet_path_for(&self.chain_path), &faucet)?;
+        Ok((tx_id, drip))
+    }
+
+    /// Faucet ki status — chal raha hai ya nahi, drip kitni, kul kitna diya.
+    pub fn faucet_status(&self) -> Value {
+        let faucet = self.faucet.lock().unwrap();
+        let (faucet_address, faucet_balance) = match &self.faucet_wallet {
+            Some(w) => {
+                let bal = self.chain.lock().unwrap().balance(&w.address);
+                (Some(w.address.clone()), Some(bal))
+            }
+            None => (None, None),
+        };
+        json!({
+            "ok": true,
+            "enabled": faucet.config.enabled,
+            "testnet_only": true,
+            "drip_amount_bits": faucet.config.drip_amount_bits,
+            "drip_but": format_but(faucet.config.drip_amount_bits),
+            "cooldown_secs": faucet.config.cooldown_secs,
+            "cooldown_hours": faucet.config.cooldown_secs / 3600,
+            "max_claims_per_ip_per_day": faucet.config.max_claims_per_ip_per_day,
+            "total_dripped_bits": faucet.total_dripped_bits,
+            "total_dripped_but": format_but(faucet.total_dripped_bits),
+            "total_claims": faucet.total_claims,
+            "faucet_address": faucet_address,
+            "faucet_balance_bits": faucet_balance,
+            "note": "Faucet sirf testnet par chalta hai — ye test coins hain, inki koi real value nahi hai. Drip ke baad coins agle block mine hone par milenge (POST /mine). Mainnet par faucet kabhi nahi chalega.",
         })
     }
 
@@ -262,8 +409,20 @@ pub fn handle_http(stream: TcpStream, state: &ApiState) -> Result<()> {
     let method = parts[0];
     let path = parts[1];
 
-    // Headers padho — sirf Content-Length chahiye.
+    // Client ka IP — faucet ki per-IP rate limit ke liye.
+    // Pehle X-Forwarded-For dekho (node apne proxy ke peeche ho to usme
+    // real IP hota hai), warna TCP peer ka IP lo. X-Forwarded-For par
+    // sirf tab bharosa karo jab proxy tumhara ho — koi bhi client use
+    // jhooth bhi likh sakta hai, isliye ye sirf spam rokne ka tareeka hai,
+    // security ki guarantee nahi.
+    let peer_ip = writer
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // Headers padho — Content-Length aur X-Forwarded-For chahiye.
     let mut content_length: usize = 0;
+    let mut forwarded_for: Option<String> = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).map_err(|e| {
@@ -277,8 +436,20 @@ pub fn handle_http(stream: TcpStream, state: &ApiState) -> Result<()> {
             content_length = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("X-Forwarded-For:") {
+            forwarded_for = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("x-forwarded-for:") {
+            forwarded_for = Some(v.trim().to_string());
         }
     }
+    let client_ip = forwarded_for
+        .and_then(|h| {
+            h.split(',')
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or(peer_ip);
     // Body padho (POST ke liye).
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
@@ -295,7 +466,7 @@ pub fn handle_http(stream: TcpStream, state: &ApiState) -> Result<()> {
         return write_cors_preflight(&mut writer);
     }
 
-    let (status, payload) = route(method, path, &body, state);
+    let (status, payload) = route(method, path, &body, state, &client_ip);
     write_json(&mut writer, status, payload)
 }
 
@@ -311,8 +482,8 @@ fn write_cors_preflight(writer: &mut TcpStream) -> Result<()> {
 }
 
 /// Routing — method + path se JSON jawab banao. Network ke bina test karne
-/// ke liye alag function hai.
-fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value) {
+/// ke liye alag function hai. `client_ip` faucet ki per-IP rate limit ke liye hai.
+fn route(method: &str, path: &str, body: &[u8], state: &ApiState, client_ip: &str) -> (u16, Value) {
     match (method, path) {
         ("GET", "/") => {
             let (height, latest_hash) = {
@@ -345,6 +516,8 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
                         "POST /slash",
                         "POST /tx",
                         "POST /mine",
+                        "POST /faucet",
+                        "GET /faucet/status",
                     ],
                 }),
             )
@@ -660,6 +833,33 @@ fn route(method: &str, path: &str, body: &[u8], state: &ApiState) -> (u16, Value
             }
             Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
         },
+        ("POST", "/faucet") => {
+            // Sirf testnet mode me — normal node par faucet_drip khud 400 dega.
+            let parsed: std::result::Result<Value, _> = serde_json::from_slice(body);
+            match parsed {
+                Ok(v) => {
+                    let address = v.get("address").and_then(|a| a.as_str()).unwrap_or("");
+                    match state.faucet_drip(address, client_ip) {
+                        Ok((tx_id, amount)) => (
+                            200,
+                            json!({
+                                "ok": true,
+                                "tx_id": tx_id,
+                                "amount_bits": amount,
+                                "amount_but": format_but(amount),
+                                "note": "Test coins mempool me gaye — agle block mine hone par (POST /mine) tumhare balance me aayenge. Ye sirf test coins hain, inki koi real value nahi.",
+                            }),
+                        ),
+                        Err(e) => (400, json!({"ok": false, "error": e.to_string()})),
+                    }
+                }
+                Err(e) => (
+                    400,
+                    json!({"ok": false, "error": format!("faucet JSON samajh nahi aaya: {e}")}),
+                ),
+            }
+        }
+        ("GET", "/faucet/status") => (200, state.faucet_status()),
         ("GET", p) if p.starts_with("/balance/") => {
             let address = &p["/balance/".len()..];
             match validate_address(address) {
@@ -1085,6 +1285,8 @@ mod tests {
             chain_path: dir.join("chain.json"),
             butpay: Arc::new(Mutex::new(ButPayRegistry::new())),
             validator,
+            faucet: Arc::new(Mutex::new(Faucet::disabled())),
+            faucet_wallet: None,
         };
         let (port, handle) = serve_test_api(&state, 9);
         // 1. GET /swap/pools — shuru me dono khaali.
@@ -1235,6 +1437,87 @@ mod tests {
         let r2 = http_raw(port, "GET /block/0 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         assert!(r2.starts_with("HTTP/1.1 200 OK"));
         assert!(body_of(&r2).contains("\"index\":0"));
+        handle.join().unwrap();
+    }
+
+    /// Testnet node ke liye alag temp dir — har test apni chain + faucet file.
+    fn testnet_state() -> ApiState {
+        static COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("but_api_test_testnet_{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        ApiState::load_or_create_testnet(&dir.join("chain.json")).unwrap()
+    }
+
+    #[test]
+    fn faucet_normal_node_par_band_hai() {
+        // Normal node (load_or_create) par faucet band rehta hai — POST 400,
+        // status me enabled false.
+        let state = test_state();
+        let bob = Wallet::from_entropy(&[2u8; 32]).unwrap();
+        let (port, handle) = serve_test_api(&state, 2);
+        let body = serde_json::to_string(&json!({"address": bob.address})).unwrap();
+        let req = format!(
+            "POST /faucet HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let r1 = http_raw(port, &req);
+        assert!(r1.starts_with("HTTP/1.1 400"), "normal node par faucet 400: {r1}");
+        assert!(body_of(&r1).contains("testnet"), "error me testnet likha ho: {}", body_of(&r1));
+        let r2 = http_raw(port, "GET /faucet/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r2.starts_with("HTTP/1.1 200 OK"), "status fail: {r2}");
+        assert!(body_of(&r2).contains("\"enabled\":false"), "status: {}", body_of(&r2));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn faucet_testnet_flow_drip_mine_balance() {
+        let state = testnet_state();
+        let bob = Wallet::from_entropy(&[2u8; 32]).unwrap();
+        let (port, handle) = serve_test_api(&state, 6);
+        // 1. POST /faucet — Bob ko 1,000,000 bits (1,000 BUT test coins).
+        let body = serde_json::to_string(&json!({"address": bob.address})).unwrap();
+        let req = format!(
+            "POST /faucet HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let r1 = http_raw(port, &req);
+        assert!(r1.starts_with("HTTP/1.1 200 OK"), "faucet fail: {r1}");
+        assert!(body_of(&r1).contains("\"amount_bits\":1000000"), "drip: {}", body_of(&r1));
+        assert!(body_of(&r1).contains("\"tx_id\""), "tx_id: {}", body_of(&r1));
+        // 2. Dobara same din — 400 (rate limit).
+        let r2 = http_raw(port, &req);
+        assert!(r2.starts_with("HTTP/1.1 400"), "dobara claim 400: {r2}");
+        assert!(body_of(&r2).contains("dobara"), "error: {}", body_of(&r2));
+        // 3. Galat address — 400.
+        let bad_body = serde_json::to_string(&json!({"address": "but1abc"})).unwrap();
+        let req3 = format!(
+            "POST /faucet HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            bad_body.len(),
+            bad_body
+        );
+        let r3 = http_raw(port, &req3);
+        assert!(r3.starts_with("HTTP/1.1 400"), "galat address 400: {r3}");
+        // 4. POST /mine — faucet tx block me jayegi.
+        let r4 = http_raw(port, "POST /mine HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        assert!(r4.starts_with("HTTP/1.1 200 OK"), "mine fail: {r4}");
+        // 5. Bob ka balance ab 1,000,000 hona chahiye — chain se aaya.
+        let req5 = format!(
+            "GET /balance/{} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            bob.address
+        );
+        let r5 = http_raw(port, &req5);
+        assert!(body_of(&r5).contains("\"balance\":1000000"), "bob balance: {}", body_of(&r5));
+        // 6. GET /faucet/status — 1 claim, 1,000,000 dripped, enabled true.
+        let r6 = http_raw(port, "GET /faucet/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(r6.starts_with("HTTP/1.1 200 OK"), "status fail: {r6}");
+        assert!(body_of(&r6).contains("\"enabled\":true"), "status: {}", body_of(&r6));
+        assert!(body_of(&r6).contains("\"total_claims\":1"), "status: {}", body_of(&r6));
+        assert!(body_of(&r6).contains("\"total_dripped_bits\":1000000"), "status: {}", body_of(&r6));
+        assert!(body_of(&r6).contains("\"drip_but\":\"1000\""), "status: {}", body_of(&r6));
         handle.join().unwrap();
     }
 }

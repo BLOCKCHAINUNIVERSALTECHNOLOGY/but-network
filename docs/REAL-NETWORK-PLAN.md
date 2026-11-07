@@ -219,6 +219,31 @@ Phase 3a ho gaya (stake-locking, BFT-only, vote gossip, reward plumbing, bits↔
 6. **Testnet** — kai machines par nodes, Red Team / Blue Team testing.
 7. **Independent audit** — production se pehle zaroori.
 
+## 8. Testnet taiyari (faucet + plan) — 7 Nov 2026
+
+**Testnet abhi launch nahi hua hai** — ye sirf taiyari hai (local only).
+Poora plan: `docs/TESTNET-PLAN.md`.
+
+| Kaam | File | Kya hua |
+|---|---|---|
+| Faucet module | `chain/src/faucet.rs` (naya) | 1,000 BUT test coins per drip, ek address din me 1 baar, ek IP se din me 10 alag addresses, claims `faucet.json` me save hote hain (restart se reset nahi hote). **Sirf testnet mode me chalta hai** — normal node par band. Faucet seedha balance nahi badalta — wo asli signed transaction bhejta hai, coins agle block mine hone par milte hain |
+| Faucet wallet | `chain/src/faucet.rs` | Testnet-only dev key (entropy `[7u8; 32]`), testnet genesis me 100,000,000 BUT fund hota hai. Test coins ki koi real value nahi |
+| API endpoints | `chain/src/api.rs` | `POST /faucet`, `GET /faucet/status`, `ApiState::load_or_create_testnet` (testnet genesis + faucet ON) |
+| CLI commands | `chain/src/main.rs` | `but-node testnet [port] [chain-file]` (faucet ON node), `but-node faucet <address> [chain-file]` (seedha mine karke drip) |
+| Testnet plan doc | `docs/TESTNET-PLAN.md` (naya) | Testnet kya hai, node kaise chalaye, faucet rules, test checklist, known limits, mainnet checklist |
+
+**Verify (7 Nov 2026):** `cargo test` **148/148 pass** (faucet 7, storage 1,
+api 2 naye). `cargo run -- demo` verify PASS (10 blocks). Live API: testnet
+node par Bob ko faucet se 1,000 BUT mile (mine ke baad balance 1,000,000
+bits), dobara claim reject, galat address reject, normal node par faucet
+band. CLI `faucet` bhi PASS (Alice ko 1,000 BUT, balance 2,000,000; dobara
+reject). `npx tsc --noEmit` pass, `npx vitest run` 58/58 pass.
+
+**Abhi bhi baaki hai (testnet launch ke liye):** hosted node + HTTPS,
+API auth + rate limiting, P2P mazboot karna, alag machines par testing,
+Red Team / Blue Team testing, independent audit, tokenomics FINAL faisle,
+BUT Coin reserves/legal, Android APK, block explorer.
+
 ---
 
 *Ye document jhooth nahi bolta. Jo real hai, wo real likha hai. Jo baaki hai, wo baaki likha hai.*

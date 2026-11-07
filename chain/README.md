@@ -24,7 +24,8 @@ hain; §10 me Muse ki sifarishein (approval pending).
 | `src/chain.rs` | Genesis (+ team account option, **Phase 3b: BUT Coin allocations**), **BFT-only** block add (`add_block_bft`, quorum + proposer check — purana PoA `add_block` HATA DIYA GAYA), balances (sirf spendable) + **BUT Coin balances (alag map)**, locked/unbonding balances, released supply, block reward mint (proposer + 0.1% team), **Phase 3b: swap pools + applied slash ops (evidence IDs)**, full chain verify (balances + BUT Coin + staking + validators + pools + slash history + released supply + team accrued). **Purana `slash_validator` (seedha state badalne wala) HATA DIYA GAYA — slash ab sirf block-level SlashOp se** |
 | `src/storage.rs` | Chain disk par JSON me save/load — load karte waqt poori verify |
 | `src/p2p.rs` | Plain-TCP P2P — height handshake, block sync (BFT verify karke add, embedded votes se quorum check), tx gossip, vote gossip (AnnounceVote / GetVotes / Votes, tally per height), **Phase 3b: BUT Pay registry sync (GetRegistry / Registry, immutable-merge, conflict par reject) + `report_equivocation` (tally se SlashOp banakar mempool me)** |
-| `src/api.rs` | Local HTTP/JSON API — `/balance/<address>` (bits + BUT + locked/total + **Phase 3b: BUT Coin balance**), `/chain/height`, `/tx`, `/mine` (BFT, proposer check, **Phase 3b: swap + slash ops bhi mine karta hai**), `/staking`, `/stake/<address>`, `POST /stake`, `POST /validators/register`, `/validators` me min_stake + released_supply, **Phase 3b: `GET /swap/quote/<from>/<to>/<amount>`, `GET /swap/pools`, `POST /swap`, `POST /slash`, `GET /mempool` me swap/slash ops bhi** |
+| `src/api.rs` | Local HTTP/JSON API — `/balance/<address>` (bits + BUT + locked/total + **Phase 3b: BUT Coin balance**), `/chain/height`, `/tx`, `/mine` (BFT, proposer check, **Phase 3b: swap + slash ops bhi mine karta hai**), `/staking`, `/stake/<address>`, `POST /stake`, `POST /validators/register`, `/validators` me min_stake + released_supply, **Phase 3b: `GET /swap/quote/<from>/<to>/<amount>`, `GET /swap/pools`, `POST /swap`, `POST /slash`, `GET /mempool` me swap/slash ops bhi**, **testnet: `POST /faucet`, `GET /faucet/status`** |
+| `src/faucet.rs` | **Testnet taiyari (naya):** testnet faucet — 1,000 BUT test coins per drip, ek address din me 1 baar, ek IP se din me 10 alag addresses, claims `faucet.json` me save hote hain. **Sirf testnet mode me chalta hai** — normal node par band. Faucet wallet testnet-only dev key (entropy `[7u8; 32]`), testnet genesis me 100,000,000 BUT fund hota hai. Test coins ki koi real value nahi. |
 | `src/main.rs` | CLI: `but-node` — demo me stake + validator register + **Phase 3b: swap (liquidity + AMM) + slash demo** bhi dikhata hai; `convert <bits\|but>` bits ↔ BUT badalta hai; **Phase 3b: `swap-quote <from> <to> <amount>`, `swap <from> <to> <amount> <private-key-hex>`**; `Wallet::from_private_key_hex` (private key se wallet, sirf sign karne ke liye — mnemonic nahi hoti) |
 
 ## Chalana
@@ -40,6 +41,8 @@ cargo run -- convert 1.5            # 1.5 BUT = 1500 bits
 cargo run -- swap-quote BUT BUTCOIN 50000 [chain-file]  # swap se pehle quote (§11)
 cargo run -- swap BUT BUTCOIN 1000 <private-key-hex> [chain-file]  # swap + direct mine (dev validator proposer hona chahiye)
 cargo run -- serve [port] [chain-file]   # local HTTP API (default 3030, data/chain.json)
+cargo run -- testnet [port] [chain-file]  # testnet node — faucet ON (free test coins)
+cargo run -- faucet <address> [chain-file]  # 1,000 BUT test coins do (sirf testnet, seedha mine)
 cargo run -- node [p2p-port] [http-port] [chain-file]  # poora node: P2P + HTTP API
 cargo run --example make_tx -- <amount> <fee> <nonce>  # signed test tx ka JSON (Alice -> Bob)
 ```
@@ -57,6 +60,14 @@ curl -X POST http://127.0.0.1:3031/tx -d @tx.json   # tx.json: make_tx se
 curl -X POST http://127.0.0.1:3031/swap -d @swapop.json  # signed SwapOp JSON
 curl -X POST http://127.0.0.1:3031/slash -d @slashop.json  # signed SlashOp JSON
 curl -X POST http://127.0.0.1:3031/mine
+```
+
+Testnet faucet (testnet node par — `cargo run -- testnet 3031 ...`):
+
+```bash
+curl -X POST http://127.0.0.1:3031/faucet -H 'Content-Type: application/json' -d '{"address": "but1..."}'
+curl -X POST http://127.0.0.1:3031/mine   # coins agle block par milte hain
+curl http://127.0.0.1:3031/faucet/status
 ```
 
 ## P2P: kyun plain TCP (libp2p kyun nahi)?
@@ -159,7 +170,8 @@ curl -X POST http://127.0.0.1:3031/mine
 - **Tokenomics ke kuch faisle abhi pending hain** — demand-based reward
   formula, baaki 59% allocation, team vesting schedule, BUT Coin
   reserves/legal (dekho `../docs/TOKENOMICS-DRAFT.md`).
-- **Testnet + faucet abhi baaki hain** — iske liye hosted node + HTTPS
+- **Testnet taiyari ho gayi hai (local)** — faucet + plan (`../docs/TESTNET-PLAN.md`).
+  **Asli testnet launch abhi baaki hai** — iske liye hosted node + HTTPS
   chahiye. **Koi independent audit nahi hua hai** — audit ke liye bahar
   ki audit firm chahiye.
 - Web wallet v1 real API se juda hai (scope `../docs/WALLET-V1-SCOPE.md`

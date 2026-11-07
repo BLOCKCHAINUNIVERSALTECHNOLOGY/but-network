@@ -12,6 +12,13 @@
 //!   /validators, /staking, /stake/<addr>, POST /tx, POST /stake,
 //!   POST /validators/register, POST /mine, GET /swap/quote, GET /swap/pools,
 //!   POST /swap, POST /slash.
+//! - `but-node testnet [http-port] [chain-file]` — **testnet node** chalao
+//!   (default port 3030, default file data/chain.json): serve jaisa hi,
+//!   par faucet ON rehta hai — `POST /faucet` se free test coins milte hain.
+//!   Testnet genesis me faucet wallet fund hota hai (100,000,000 BUT test coins).
+//! - `but-node faucet <address> [chain-file]` — testnet faucet se 1,000 BUT
+//!   test coins do: signed transaction + seedha mine (dev validator proposer
+//!   hona chahiye). Ek address din me 1 baar. Sirf testnet chain par chalta hai.
 //! - `but-node node [p2p-port] [http-port] [chain-file]` — poora node chalao:
 //!   P2P listener + HTTP API, ek saath (default 9001 / 3030).
 //! - `but-node p2p-demo` — do nodes (alag ports) banao aur sync karke dikhao
@@ -35,11 +42,13 @@
 use but_chain::api::{serve_forever as serve_api, ApiState};
 use but_chain::butpay::ButPayRegistry;
 use but_chain::consensus::{Vote, VoteTally};
+use but_chain::faucet::{faucet_wallet, DEFAULT_DRIP_BITS};
 use but_chain::p2p::Node;
 use but_chain::slash::SlashOp;
 use but_chain::staking::{LockTier, StakeOp};
 use but_chain::storage::{
-    butpay_path_for, load_butpay, load_chain, load_chain_with_registry, save_butpay, save_chain,
+    butpay_path_for, faucet_path_for, load_butpay, load_chain, load_chain_with_registry,
+    load_faucet, save_butpay, save_chain, save_faucet,
 };
 use but_chain::swap::{format_butcoin, SwapAsset, SwapOp};
 use but_chain::units::{format_but, format_but_with_unit, parse_but};
@@ -97,6 +106,22 @@ fn main() {
             let path = args.get(3).map(|s| s.as_str()).unwrap_or("data/chain.json");
             if let Err(e) = run_serve(port, path) {
                 eprintln!("serve fail: {e}");
+                std::process::exit(1);
+            }
+        }
+        "testnet" => {
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3030);
+            let path = args.get(3).map(|s| s.as_str()).unwrap_or("data/chain.json");
+            if let Err(e) = run_testnet(port, path) {
+                eprintln!("testnet fail: {e}");
+                std::process::exit(1);
+            }
+        }
+        "faucet" => {
+            let address = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            let chain_file = args.get(3).map(|s| s.as_str()).unwrap_or("data/chain.json");
+            if let Err(e) = run_faucet(address, chain_file) {
+                eprintln!("faucet fail: {e}");
                 std::process::exit(1);
             }
         }
@@ -171,6 +196,8 @@ fn main() {
             println!("  but-node demo              chhoti chain banao + verify + save");
             println!("  but-node verify <file>     chain file verify karo");
             println!("  but-node serve [port] [chain-file]   local HTTP API (default 3030, data/chain.json)");
+            println!("  but-node testnet [port] [chain-file]   testnet node — faucet ON (free test coins)");
+            println!("  but-node faucet <address> [chain-file]   1,000 BUT test coins do (sirf testnet)");
             println!("  but-node node [p2p-port] [http-port] [chain-file]   poora node: P2P + HTTP API");
             println!("  but-node p2p-demo          do nodes banao aur sync karke dikhao");
             println!("  but-node convert <bits|but>   bits <-> BUT badlo (1 BUT = 1,000 bits)");
@@ -196,6 +223,92 @@ fn run_serve(port: u16, chain_file: &str) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("port {port} par sun nahi paya: {e}"))?;
     serve_api(listener, &state).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Testnet node chalao — serve jaisa hi, par faucet ON rehta hai.
+/// Pehli baar chalane par testnet genesis banta hai (faucet wallet fund
+/// hota hai). Faucet se free test coins milte hain — POST /faucet.
+/// Ye sirf testnet hai: test coins ki koi real value nahi hai.
+fn run_testnet(port: u16, chain_file: &str) -> Result<(), String> {
+    let state =
+        ApiState::load_or_create_testnet(Path::new(chain_file)).map_err(|e| e.to_string())?;
+    let (height, hash, faucet_balance) = {
+        let chain = state.chain.lock().unwrap();
+        let fw = faucet_wallet();
+        (
+            chain.height(),
+            chain.latest_hash(),
+            chain.balance(&fw.address),
+        )
+    };
+    let faucet = state.faucet.lock().unwrap();
+    println!("BUT TESTNET node chal raha hai: http://127.0.0.1:{port}/");
+    println!("Chain: {height} blocks, latest hash {hash}");
+    println!(
+        "Faucet: {} (drip {} bits = {} BUT, ek address din me 1 baar, ek IP se din me 10) — kul diya: {} claims, {} bits",
+        if faucet.config.enabled { "ON" } else { "OFF" },
+        DEFAULT_DRIP_BITS,
+        format_but(DEFAULT_DRIP_BITS),
+        faucet.total_claims,
+        faucet.total_dripped_bits
+    );
+    println!("Faucet wallet balance: {faucet_balance} bits (test coins)");
+    println!("Endpoints: POST /faucet, GET /faucet/status, /chain/height, /balance/<address>, POST /tx, POST /mine");
+    println!("WARNING: ye testnet hai — test coins ki koi real value nahi hai. Mainnet par faucet kabhi nahi chalega.");
+    println!("Band karne ke liye Ctrl-C dabao.");
+    drop(faucet);
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("port {port} par sun nahi paya: {e}"))?;
+    serve_api(listener, &state).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Faucet se test coins do — CLI se, seedha mine karke.
+/// Sirf testnet chain par chalta hai (faucet.json me enabled hona chahiye).
+/// Dev validator us height ka proposer hona chahiye — warna saaf error
+/// milega (tab API `POST /faucet` se mempool me bhejo, proposer mine karega).
+fn run_faucet(address: &str, chain_file: &str) -> Result<(), String> {
+    let path = Path::new(chain_file);
+    let (mut chain, reg) = load_chain_with_registry(path).map_err(|e| e.to_string())?;
+    let faucet_path = faucet_path_for(path);
+    let mut faucet = load_faucet(&faucet_path).map_err(|e| e.to_string())?;
+    if !faucet.config.enabled {
+        return Err(
+            "is chain par faucet band hai — faucet sirf testnet chain par chalta hai. Testnet node chalao: but-node testnet [port] [chain-file]"
+                .to_string(),
+        );
+    }
+    faucet
+        .can_claim(address, "cli", now_secs())
+        .map_err(|e| e.to_string())?;
+    let fw = faucet_wallet();
+    let drip = faucet.config.drip_amount_bits;
+    if chain.balance(&fw.address) < drip {
+        return Err(format!(
+            "faucet wallet me test coins khatm ho gaye — balance {} bits, drip {drip} bits chahiye. Testnet genesis dobara banao.",
+            chain.balance(&fw.address)
+        ));
+    }
+    let mut tx = Transaction::new(fw.address.clone(), address.to_string(), drip, 0, chain.next_nonce(&fw.address));
+    tx.sign(&fw.signing_key()).map_err(|e| e.to_string())?;
+    let dev = but_chain::api::dev_validator();
+    bft_add(
+        &mut chain,
+        &[dev],
+        vec![tx],
+        Vec::new(),
+        now_secs(),
+        &reg,
+    )?;
+    save_chain(&chain, path).map_err(|e| e.to_string())?;
+    save_butpay(&butpay_path_for(path), &reg).map_err(|e| e.to_string())?;
+    faucet.record_claim(address, "cli", now_secs(), drip);
+    save_faucet(&faucet_path, &faucet).map_err(|e| e.to_string())?;
+    println!("Faucet: {address} ko {drip} bits test coins mile ({} BUT) — block {} me jud gaya",
+        format_but(drip), chain.height() - 1);
+    println!("Balance ab: {} bits ({})", chain.balance(address), format_but_with_unit(chain.balance(address)));
+    println!("Note: ye sirf test coins hain — inki koi real value nahi hai.");
     Ok(())
 }
 
