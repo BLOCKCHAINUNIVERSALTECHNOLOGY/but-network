@@ -1,26 +1,32 @@
 /**
- * shared/wallet-secure.ts — DEMO ONLY (sirf demo ke liye)
+ * shared/wallet-secure.ts — BUT Wallet (real wallet, web v1)
  *
- * Ye module demo wallet banane ke liye hai: mnemonic, keypair, address
+ * Ye module BUT wallet banane ke liye hai: mnemonic, keypair, address
  * aur password se encrypt kiya hua wallet vault.
  *
  * ZAROORI SACH — pehle padho:
- * - Ye module is demo ko asli wallet ya production blockchain NAHI banata.
- * - Isse bana wallet SIRF DEMO hai. Isme asli paisa kabhi mat rakho.
- * - Mnemonic ab REAL BIP39 hai: 24 words, official 2048-word English list
+ * - Mnemonic REAL BIP39 hai: 24 words, official 2048-word English list
  *   (shared/bip39-wordlist.ts, source: bitcoin/bips). Lekin implementation
- *   haath se likha hai — vetted `bip39` library use NAHI hui, kyunki npm
- *   install fail hua (project pnpm-managed hai, pnpm is machine par nahi
- *   hai). Production se pehle vetted library + independent audit CHAHIYE.
+ *   haath se likha hai — vetted `bip39` library use NAHI hui.
+ *   Production se pehle vetted library + independent audit CHAHIYE.
+ * - **Mnemonic HI wallet hai** — keypair mnemonic se banta hai (BIP39 seed
+ *   ke pehle 32 bytes se Ed25519 keypair, bilkul waisa hi jaise Rust core
+ *   `chain/src/wallet.rs` me hai). Wahi 24 words hamesha wahi address
+ *   denge — isliye seed se wallet wapas laya ja sakta hai. (Purane demo me
+ *   mnemonic aur keypair alag-alag bante the — wo galti ab theek hai.)
+ * - Ed25519 signing ke liye vetted `tweetnacl` library use hoti hai
+ *   (pure-JS, audited). Signing ka code `shared/but-tx.ts` me hai.
  * - Slow unlock (2 minute) brute-force ko mehenga banata hai, par ye
  *   wallet ko "unbreakable" NAHI banata. Kamzor password (jaise "123456")
  *   phir bhi dictionary attack se toot jayega. Strong, unique password
  *   (kam se kam 12 akshar) hamesha zaroori hai.
- * - Ye WEB demo hai. Ye Android Keystore / iPhone Secure Enclave ko use
+ * - Ye WEB wallet hai. Ye Android Keystore / iPhone Secure Enclave ko use
  *   NAHI kar sakta. Asli phone me hardware-backed storage ke liye asli
  *   Android app chahiye (EncryptedSharedPreferences + Android Keystore).
- *   Web demo me encrypted vault localStorage me rehta hai — ye hardware
+ *   Web me encrypted vault localStorage me rehta hai — ye hardware
  *   storage NAHI hai. Slow KDF yahan uski kami ko thoda kam karta hai.
+ * - Koi independent audit abhi nahi hua hai. Asli paisa tabhi rakho jab
+ *   audit ho aur tum seed phrase ko kagaz par surakshit rakh sako.
  *
  * 1024-BIT WALI BAAT — SAHI SAMAJH:
  * - "1024-bit wallet" agar RSA-1024 matlab hai to wo GALAT raasta hai.
@@ -46,17 +52,12 @@
  *   Password sirf user ki memory me aur unlock ke waqt RAM me rehta hai.
  */
 
+import nacl from "tweetnacl";
 import { BIP39_WORDLIST } from "./bip39-wordlist";
 
 /** BIP39 official English wordlist (2048 words) — bahar se bhi use ho sake. */
 export { BIP39_WORDLIST };
-import {
-  decryptFromLocalStorage,
-  encryptForLocalStorage,
-  generateDemoKeypair,
-  secureRandomBytes,
-  sha256Hex,
-} from "./crypto-secure";
+import { secureRandomBytes, sha256Hex } from "./crypto-secure";
 
 // ---------------------------------------------------------------------------
 // 0. Fixed-length spec — Sanjay ka faisla (na kam, na zyada)
@@ -297,8 +298,8 @@ export async function mnemonicToSeed(
 // 3. Wallet banana: keypair + mnemonic + address (fixed lengths)
 // ---------------------------------------------------------------------------
 
-export type DemoWallet = {
-  /** Address: bilkul 56 characters — "but1" + SHA-256(public key) ke pehle 26 bytes (hex). */
+export type ButWallet = {
+  /** Address: bilkul 56 characters — "but1" + SHA-256(public key) ke pehle 52 hex characters. */
   address: string;
   /** Public key, base64 (SPKI). Share karna safe hai. */
   publicKeyBase64: string;
@@ -315,72 +316,59 @@ export type DemoWallet = {
   warning: string;
 };
 
+/** Purana naam — compatibility ke liye alias (naya code ButWallet use kare). */
+export type DemoWallet = ButWallet;
+
 const WALLET_WARNING =
-  "DEMO WALLET — Ye sirf demo ke liye hai. Isme asli paisa kabhi mat rakho. Mnemonic aur private key ko kisi ko mat dikhao.";
+  "Mnemonic aur private key ko kisi ko mat dikhao. Seed phrase sirf kagaz par likho — photo / cloud / chat me kabhi nahi. Is wallet ka abhi independent audit nahi hua hai.";
 
 /** Ed25519 SPKI DER ka shuruwaati hissa (12 bytes), uske baad 32-byte public key. */
 const ED25519_SPKI_PREFIX = [
   0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
-/** Ed25519 PKCS8 DER ka shuruwaati hissa (16 bytes), uske baad 32-byte seed. */
-const ED25519_PKCS8_PREFIX = [
-  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-  0x04, 0x22, 0x04, 0x20,
-];
-
-function extractEd25519RawKey(
-  derBase64: string,
-  prefix: number[],
-  label: string,
-): Uint8Array {
-  const der = base64ToBytes(derBase64);
-  if (der.length !== prefix.length + 32) {
-    throw new Error(`${label} ka format sahi nahi hai (Ed25519 chahiye).`);
-  }
-  for (let i = 0; i < prefix.length; i++) {
-    if (der[i] !== prefix[i]) {
-      throw new Error(`${label} ka format sahi nahi hai (Ed25519 chahiye).`);
-    }
-  }
-  return der.slice(prefix.length);
-}
-
 /**
- * Naya demo wallet banao: CSPRNG se 24-word BIP39 mnemonic + Ed25519
- * keypair, address SHA-256 se (bilkul 56 characters). Private key bilkul
- * 128 hex characters ki hogi. Fixed lengths check karke hi return hoga.
+ * 24-word mnemonic se wallet banao — DETERMINISTIC: wahi words, wahi
+ * address, wahi private key. Rust core (`chain/src/wallet.rs`) ke saath
+ * bilkul same derivation:
+ *   seed = PBKDF2-HMAC-SHA512(mnemonic, salt "mnemonic", 2048 iters, 64 bytes)
+ *   secret = seed[0..32] → Ed25519 keypair (tweetnacl)
+ *   address = "but1" + sha256(public key) ke pehle 52 hex characters
+ *   private key = hex(secret) + hex(public key) — bilkul 128 characters
  */
-export async function generateWallet(): Promise<DemoWallet> {
-  const keypair = await generateDemoKeypair();
-  if (keypair.algorithm !== "Ed25519") {
-    throw new Error(
-      "Fixed-length wallet ke liye Ed25519 chahiye — is device par Ed25519 available nahi hai.",
-    );
-  }
-  const publicKeyRaw = extractEd25519RawKey(
-    keypair.publicKeyBase64,
-    ED25519_SPKI_PREFIX,
-    "Public key",
-  );
-  const seedRaw = extractEd25519RawKey(
-    keypair.privateKeyBase64,
-    ED25519_PKCS8_PREFIX,
-    "Private key",
-  );
-  const privateKeyHex = bytesToHex(seedRaw) + bytesToHex(publicKeyRaw);
+export async function walletFromMnemonic(
+  mnemonic: string,
+): Promise<ButWallet> {
+  const seed64 = await mnemonicToSeed(mnemonic);
+  const secretSeed = seed64.slice(0, 32);
+  const keypair = nacl.sign.keyPair.fromSeed(secretSeed);
+  const publicKeyRaw = keypair.publicKey;
+  const privateKeyHex = bytesToHex(secretSeed) + bytesToHex(publicKeyRaw);
   const addressHash = await sha256Hex(publicKeyRaw);
   const address = `${ADDRESS_PREFIX}${addressHash.slice(0, 52)}`;
-  const mnemonic = await generateMnemonic();
+  const publicKeyBase64 = bytesToBase64(
+    new Uint8Array([...ED25519_SPKI_PREFIX, ...publicKeyRaw]),
+  );
   assertFixedLengths(address, privateKeyHex);
   return {
     address,
-    publicKeyBase64: keypair.publicKeyBase64,
+    publicKeyBase64,
     privateKeyHex,
-    algorithm: keypair.algorithm,
-    mnemonic,
+    algorithm: "Ed25519",
+    mnemonic: mnemonic.trim().split(/\s+/).join(" "),
     warning: WALLET_WARNING,
   };
+}
+
+/**
+ * Naya wallet banao: CSPRNG se 24-word BIP39 mnemonic, phir usi mnemonic
+ * se keypair (walletFromMnemonic). Private key bilkul 128 hex characters
+ * ki hogi, address bilkul 56 characters ka. Fixed lengths check karke hi
+ * return hoga.
+ */
+export async function generateWallet(): Promise<ButWallet> {
+  const mnemonic = await generateMnemonic();
+  return walletFromMnemonic(mnemonic);
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +507,7 @@ export async function deriveWalletKey(
 // 5. Wallet vault: private key ko encrypt karke store karo
 //    Mnemonic yahan store NAHI hota — user ko ek baar dikhao, likhwao,
 //    phir bhool jao. Vault me sirf keypair + address rehta hai.
-//    Payload v3 hai — purana v2 demo vault isse NAHI khulega (demo only).
+//    Payload v3 hai — purana v2 vault isse NAHI khulega.
 // ---------------------------------------------------------------------------
 
 export type WalletVault = {
@@ -645,9 +633,9 @@ export async function decryptWalletVault(
 }
 
 /**
- * Demo wallet ko encrypt karke localStorage me save karo.
- * Sirf DEMO wallet ke liye hai. Ye hardware-backed storage NAHI hai —
- * asli phone me hardware storage ke liye asli Android app chahiye.
+ * Wallet vault ko encrypt karke localStorage me save karo.
+ * Ye hardware-backed storage NAHI hai — asli phone me hardware storage
+ * ke liye asli Android app chahiye.
  */
 export async function saveEncryptedWallet(
   key: string,
@@ -676,6 +664,3 @@ export async function loadEncryptedWallet(
   if (!stored) return null;
   return decryptWalletVault(stored, password);
 }
-
-// Re-export: demo ledger encrypt karne ke liye purana module bhi use hota hai.
-export { decryptFromLocalStorage, encryptForLocalStorage } from "./crypto-secure";

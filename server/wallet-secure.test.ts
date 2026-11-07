@@ -16,6 +16,7 @@ import {
   mnemonicToSeed,
   parsePrivateKeyHex,
   validateMnemonic,
+  walletFromMnemonic,
 } from "../shared/wallet-secure";
 import { BIP39_WORDLIST as WORDLIST } from "../shared/bip39-wordlist";
 
@@ -45,7 +46,32 @@ describe("wallet-secure — fixed-length spec (24 / 128 / 56)", () => {
     expect(a.algorithm).toBe("Ed25519");
     expect(a.mnemonic.split(" ").length).toBe(MNEMONIC_WORD_COUNT);
     expect(a.mnemonic).not.toBe(b.mnemonic);
-    expect(a.warning).toContain("DEMO");
+    // Real wallet — warning me "DEMO" nahi hona chahiye.
+    expect(a.warning).not.toContain("DEMO");
+    expect(a.warning).toContain("audit");
+  });
+
+  it("wahi mnemonic hamesha wahi wallet deta hai (deterministic — seed se wallet wapas milega)", async () => {
+    const a = await generateWallet();
+    const again = await walletFromMnemonic(a.mnemonic);
+    expect(again.address).toBe(a.address);
+    expect(again.privateKeyHex).toBe(a.privateKeyHex);
+    expect(again.publicKeyBase64).toBe(a.publicKeyBase64);
+    const other = await generateWallet();
+    expect(other.address).not.toBe(a.address);
+  });
+
+  it("BIP39 test vector 'abandon' x23 + 'art' — Rust core jaisa hi address/private key", async () => {
+    // Ye values Rust core (chain/examples/print_wallet) se li gayi hain —
+    // TS aur Rust ka derivation bilkul same hona chahiye.
+    const w = await walletFromMnemonic(VECTOR_MNEMONIC);
+    expect(w.address).toBe(
+      "but1e28c3608979d45d2c7dc74b1c19519e54ce8961c882f79b20b6b",
+    );
+    expect(w.privateKeyHex).toBe(
+      "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf701de352e44cd333672593f2334a730e180aaf290de89aa16d480de594e34e2961",
+    );
+    expect(w.publicKeyBase64).toMatch(/^[A-Za-z0-9+/]+={0,2}$/);
   });
 
   it("mnemonic bilkul 24 words ka hota hai, saare BIP39 list me, checksum sahi", async () => {

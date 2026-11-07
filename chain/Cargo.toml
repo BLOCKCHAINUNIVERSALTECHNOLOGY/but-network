@@ -1,0 +1,24 @@
+[package]
+name = "but_chain"
+version = "0.1.0"
+edition = "2021"
+description = "BUT Network — real blockchain core (Phase 1 foundation). Rust. NOT mainnet-grade yet: no P2P, no independent audit."
+license = "Apache-2.0"
+
+[lib]
+name = "but_chain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "but-node"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+# Real BIP39 (vetted crate, official 2048-word list). Mnemonic 24 words = 256-bit entropy.
+bip39 = "2"
