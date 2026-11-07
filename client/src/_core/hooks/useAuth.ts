@@ -45,16 +45,35 @@ export function useAuth(options?: UseAuthOptions) {
       try {
         sessionStorage.removeItem("manus-cookie");
       } catch {}
+      // FIX: logout par localStorage me rakhi user info bhi hatao. Pehle ye
+      // key logout ke baad bhi rehti thi — ab nahi rahegi.
+      try {
+        localStorage.removeItem("manus-runtime-user-info");
+      } catch {}
       utils.auth.me.setData(undefined, null);
       await utils.auth.me.invalidate();
     }
   }, [logoutMutation, utils]);
 
+  // FIX: localStorage likhna side effect hai — ye useMemo (render) me nahi,
+  // useEffect me hona chahiye. Pehle har render par likha jata tha. Data
+  // wahi hai (sirf profile info, koi token/key nahi), sirf jagah badli hai.
+  useEffect(() => {
+    try {
+      if (meQuery.data) {
+        localStorage.setItem(
+          "manus-runtime-user-info",
+          JSON.stringify(meQuery.data),
+        );
+      } else {
+        localStorage.removeItem("manus-runtime-user-info");
+      }
+    } catch {
+      // Storage na mile to ignore karo — login is par depend nahi karta.
+    }
+  }, [meQuery.data]);
+
   const state = useMemo(() => {
-    localStorage.setItem(
-      "manus-runtime-user-info",
-      JSON.stringify(meQuery.data)
-    );
     return {
       user: meQuery.data ?? null,
       loading: meQuery.isLoading || logoutMutation.isPending,

@@ -294,6 +294,8 @@ const computeBackoffDelay = (
   retryAfterMs?: number
 ): number => {
   const cap = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS);
+  // NOTE: yahan Math.random() sirf retry delay ka jitter hai (timing).
+  // Ye kabhi key, seed, password ya security ke liye use NAHI hota.
   const jittered = cap / 2 + Math.random() * (cap / 2);
   return Math.min(Math.max(jittered, retryAfterMs ?? 0), RETRY_MAX_DELAY_MS);
 };

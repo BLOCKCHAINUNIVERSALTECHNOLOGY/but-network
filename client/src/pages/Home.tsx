@@ -1,4 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import {
+  loadEncryptedDemoData,
+  saveEncryptedDemoData,
+} from "@shared/crypto-secure";
 import {
   ArrowDownLeft,
   ArrowUpRight,
@@ -35,8 +39,20 @@ type Transaction = {
 const BALANCE_KEY = "but-demo-balance-v1";
 const TRANSACTIONS_KEY = "but-demo-transactions-v1";
 const MODE_KEY = "but-demo-mode-v1";
+// Naya encrypted ledger: balance + transactions AES-GCM se encrypt hokar
+// ek hi key me save hote hain. Purani plain keys sirf ek baar migration
+// ke liye padhi jati hain, phir delete kar di jati hain.
+const ENCRYPTED_LEDGER_KEY = "but-demo-ledger-enc-v1";
+// Demo password kam se kam 12 akshar ka hona chahiye. Password kabhi
+// code me ya localStorage me store NAHI hota — sirf RAM (state) me rehta hai.
+const MIN_DEMO_PASSWORD_LENGTH = 12;
 const DEMO_RECEIVE_ADDRESS = "BUT-DEMO-7J2K-Q9LX";
 const DEFAULT_BALANCE = 4280.5;
+
+type LedgerData = {
+  balance: number;
+  transactions: Transaction[];
+};
 
 const starterTransactions: Transaction[] = [
   {
@@ -118,12 +134,10 @@ export default function Home() {
     return saved === "cold" ? "cold" : "hot";
   });
   const [tab, setTab] = useState<Tab>("wallet");
-  const [balance, setBalance] = useState<number>(() =>
-    readStored(BALANCE_KEY, DEFAULT_BALANCE),
-  );
-  const [transactions, setTransactions] = useState<Transaction[]>(() =>
-    readStored(TRANSACTIONS_KEY, starterTransactions),
-  );
+  // Balance/transactions tab unlock hone ke baad bhare jate hain — pehle
+  // sirf defaults dikhte hain. Unlock ke bina asli saved data nahi khulta.
+  const [balance, setBalance] = useState<number>(DEFAULT_BALANCE);
+  const [transactions, setTransactions] = useState<Transaction[]>(starterTransactions);
   const [balanceVisible, setBalanceVisible] = useState(true);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [amount, setAmount] = useState("");
@@ -131,15 +145,175 @@ export default function Home() {
   const [formError, setFormError] = useState("");
   const [copied, setCopied] = useState(false);
 
+  // ---- Encrypted ledger lock ----
+  // Password sirf RAM me rehta hai (state), kabhi code ya localStorage me nahi.
+  const [locked, setLocked] = useState(true);
+  const [password, setPassword] = useState<string | null>(null);
+  const [passwordInput, setPasswordInput] = useState("");
+  const [unlockError, setUnlockError] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+  const [migrationNotice, setMigrationNotice] = useState("");
+  // Kya encrypted data hai? Kya purana plain data hai (migration ke liye)?
+  const [hasEncrypted, setHasEncrypted] = useState(false);
+  const [hasLegacyPlain, setHasLegacyPlain] = useState(false);
+  // Unlock ke baad hi save karo — pehle save karne se defaults overwrite ho jayenge.
+  const hydratedRef = useRef(false);
+
+  // Pehli baar: sirf ye check karo ki kya-kya saved hai. Decrypt yahan nahi hota.
   useEffect(() => {
-    window.localStorage.setItem(BALANCE_KEY, JSON.stringify(balance));
-  }, [balance]);
-  useEffect(() => {
-    window.localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(transactions));
-  }, [transactions]);
+    try {
+      setHasEncrypted(
+        window.localStorage.getItem(ENCRYPTED_LEDGER_KEY) !== null,
+      );
+      setHasLegacyPlain(
+        window.localStorage.getItem(BALANCE_KEY) !== null ||
+          window.localStorage.getItem(TRANSACTIONS_KEY) !== null,
+      );
+    } catch {
+      setHasEncrypted(false);
+      setHasLegacyPlain(false);
+    }
+  }, []);
+
+  // Mode sensitive nahi hai (hot/cold), isliye ye plain hi rehta hai.
   useEffect(() => {
     window.localStorage.setItem(MODE_KEY, JSON.stringify(mode));
   }, [mode]);
+
+  // Unlock hone ke baad har badlav encrypt karke save karo.
+  useEffect(() => {
+    if (!hydratedRef.current || locked || !password) return;
+    const ledger: LedgerData = { balance, transactions };
+    saveEncryptedDemoData(
+      ENCRYPTED_LEDGER_KEY,
+      JSON.stringify(ledger),
+      password,
+    ).catch(() => {
+      // Save fail hua to screen par data dikhta rahega, par save nahi hoga.
+      // User ko dobara unlock karne ko kaho — data RAM me safe hai.
+      setUnlockError(
+        "Demo data save nahi ho paya. Dobara lock karke unlock karo.",
+      );
+    });
+  }, [balance, transactions, locked, password]);
+
+  function readLegacyLedger(): LedgerData | null {
+    try {
+      const legacyBalance = readStored<number>(BALANCE_KEY, DEFAULT_BALANCE);
+      const legacyTransactions = readStored<Transaction[]>(
+        TRANSACTIONS_KEY,
+        starterTransactions,
+      );
+      if (
+        typeof legacyBalance !== "number" ||
+        !Number.isFinite(legacyBalance) ||
+        !Array.isArray(legacyTransactions)
+      ) {
+        return null;
+      }
+      return { balance: legacyBalance, transactions: legacyTransactions };
+    } catch {
+      return null;
+    }
+  }
+
+  function clearLegacyPlainKeys() {
+    try {
+      window.localStorage.removeItem(BALANCE_KEY);
+      window.localStorage.removeItem(TRANSACTIONS_KEY);
+    } catch {
+      // Ignore — plain keys na haten to bhi encrypted copy hi use hogi.
+    }
+  }
+
+  async function handleUnlock(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const pw = passwordInput;
+    if (pw.length < MIN_DEMO_PASSWORD_LENGTH) {
+      setUnlockError(
+        `Demo password kam se kam ${MIN_DEMO_PASSWORD_LENGTH} akshar ka hona chahiye.`,
+      );
+      return;
+    }
+    setUnlocking(true);
+    setUnlockError("");
+    try {
+      const encrypted = window.localStorage.getItem(ENCRYPTED_LEDGER_KEY);
+      if (encrypted) {
+        // Purana encrypted data hai — password se kholo.
+        let decrypted: string | null;
+        try {
+          decrypted = await loadEncryptedDemoData(ENCRYPTED_LEDGER_KEY, pw);
+        } catch {
+          setUnlockError(
+            "Galat password ya data kharab hai. Sahi password likho, ya demo reset karo — reset karne par purana data delete ho jayega.",
+          );
+          return;
+        }
+        if (decrypted === null) {
+          setUnlockError("Saved data nahi mila. Demo reset karo.");
+          return;
+        }
+        let parsed: LedgerData;
+        try {
+          parsed = JSON.parse(decrypted) as LedgerData;
+        } catch {
+          setUnlockError(
+            "Saved data padha nahi gaya. Demo reset karo — purana data delete ho jayega.",
+          );
+          return;
+        }
+        if (
+          typeof parsed.balance !== "number" ||
+          !Array.isArray(parsed.transactions)
+        ) {
+          setUnlockError(
+            "Saved data sahi format me nahi hai. Demo reset karo.",
+          );
+          return;
+        }
+        setBalance(parsed.balance);
+        setTransactions(parsed.transactions);
+      } else {
+        // Pehli baar: purana plain data hai to use encrypt karke migrate karo.
+        const legacy = readLegacyLedger();
+        const ledger: LedgerData = legacy ?? {
+          balance: DEFAULT_BALANCE,
+          transactions: starterTransactions,
+        };
+        await saveEncryptedDemoData(
+          ENCRYPTED_LEDGER_KEY,
+          JSON.stringify(ledger),
+          pw,
+        );
+        if (legacy) {
+          clearLegacyPlainKeys();
+          setMigrationNotice(
+            "Purana plain data encrypt karke save kar diya gaya hai. Purani plain copy delete kar di gayi hai.",
+          );
+        }
+        setBalance(ledger.balance);
+        setTransactions(ledger.transactions);
+      }
+      setPassword(pw);
+      setPasswordInput("");
+      hydratedRef.current = true;
+      setLocked(false);
+      setHasEncrypted(true);
+      setHasLegacyPlain(false);
+    } finally {
+      setUnlocking(false);
+    }
+  }
+
+  function lockDemo() {
+    // Password sirf RAM me tha — lock karte hi bhool jao.
+    setPassword(null);
+    setPasswordInput("");
+    setUnlockError("");
+    hydratedRef.current = false;
+    setLocked(true);
+  }
 
   const openDialog = (kind: DialogKind) => {
     setAmount("");
@@ -201,10 +375,27 @@ export default function Home() {
   };
 
   const resetDemo = () => {
+    // Reset ka matlab: encrypted aur purana plain data dono delete karo,
+    // phir lock screen par wapas jao. Password bhi RAM se hata do.
+    try {
+      window.localStorage.removeItem(ENCRYPTED_LEDGER_KEY);
+      window.localStorage.removeItem(BALANCE_KEY);
+      window.localStorage.removeItem(TRANSACTIONS_KEY);
+    } catch {
+      // Ignore — agla unlock fresh data se shuru hoga.
+    }
     setBalance(DEFAULT_BALANCE);
     setTransactions(starterTransactions);
     setMode("hot");
     setTab("wallet");
+    setPassword(null);
+    setPasswordInput("");
+    setUnlockError("");
+    setMigrationNotice("");
+    setHasEncrypted(false);
+    setHasLegacyPlain(false);
+    hydratedRef.current = false;
+    setLocked(true);
   };
 
   const pageTitles: Record<Tab, string> = {
@@ -283,7 +474,89 @@ export default function Home() {
             <span><strong>केवल डेमो</strong> — यहाँ असली पैसा, निजी कुंजी या ब्लॉकचेन नेटवर्क नहीं है।</span>
           </div>
 
-          {tab === "wallet" && (
+          {locked ? (
+            <section className="ledger-page" aria-label="डेमो लॉक">
+              <div className="page-heading">
+                <div>
+                  <p className="eyebrow">सुरक्षित डेमो</p>
+                  <h1>डेमो लॉक है</h1>
+                  <p className="subheading">
+                    Tumhara demo ledger ab encrypt karke save hota hai.
+                    Khulne ke liye demo password likho.
+                  </p>
+                </div>
+              </div>
+              {hasLegacyPlain && !hasEncrypted && (
+                <div className="privacy-callout cold-callout" role="alert">
+                  <ShieldAlert size={19} />
+                  <p>
+                    <strong>Purana plain data mila hai!</strong> Pehle ye
+                    data bina encryption ke save hota tha, jo safe nahi tha.
+                    Password banate hi hum use encrypt karke save karenge aur
+                    purani plain copy delete kar denge.
+                  </p>
+                </div>
+              )}
+              {hasEncrypted && (
+                <div className="privacy-callout hot-callout" role="status">
+                  <ShieldCheck size={19} />
+                  <p>
+                    Encrypted data mila hai. Sahi password likhne par hi
+                    ledger khulega.
+                  </p>
+                </div>
+              )}
+              <form onSubmit={handleUnlock} className="activity-panel">
+                <label className="form-field">
+                  <span>डेमो पासवर्ड (कम से कम 12 अक्षर)</span>
+                  <input
+                    autoFocus
+                    type="password"
+                    value={passwordInput}
+                    onChange={(event) => setPasswordInput(event.target.value)}
+                    placeholder="Demo password likho"
+                    autoComplete="new-password"
+                    minLength={MIN_DEMO_PASSWORD_LENGTH}
+                  />
+                </label>
+                <p className="balance-subtext">
+                  Password kahin save nahi hota — sirf tumhari memory me
+                  rehta hai. Password bhool gaye to data nahi khulega, sirf
+                  demo reset karna padega.
+                </p>
+                {unlockError && (
+                  <p className="form-error" role="alert">{unlockError}</p>
+                )}
+                <div className="modal-actions">
+                  <button
+                    className="action-button action-primary"
+                    type="submit"
+                    disabled={unlocking}
+                  >
+                    {unlocking ? "Unlock ho raha hai..." : "Unlock karo"}
+                  </button>
+                  <button
+                    className="action-button action-secondary"
+                    onClick={resetDemo}
+                    type="button"
+                  >
+                    डेमो रीसेट
+                  </button>
+                </div>
+              </form>
+              <p className="balance-subtext">
+                Ye sirf demo hai — asli wallet ya asli paisa nahi hai.
+              </p>
+            </section>
+          ) : (
+            <>
+              {migrationNotice && (
+                <div className="privacy-callout hot-callout" role="status">
+                  <ShieldCheck size={19} />
+                  <p>{migrationNotice}</p>
+                </div>
+              )}
+              {tab === "wallet" && (
             <>
               <div className="page-heading">
                 <div>
@@ -291,6 +564,7 @@ export default function Home() {
                   <h1>नमस्ते, डेमो उपयोगकर्ता</h1>
                   <p className="subheading">BUT के Hot और Cold मोड को सुरक्षित डेमो में समझें।</p>
                 </div>
+                <button className="text-button" onClick={lockDemo} type="button">Lock karo</button>
                 <button className="text-button" onClick={resetDemo} type="button">डेमो रीसेट</button>
               </div>
 
@@ -434,6 +708,8 @@ export default function Home() {
           )}
 
           {tab === "storage" && <StorageExplainer />}
+            </>
+          )}
         </main>
       </div>
 

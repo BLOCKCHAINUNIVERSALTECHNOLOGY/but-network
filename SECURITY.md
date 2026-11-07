@@ -9,6 +9,8 @@
 - Isme Hot Mode aur Cold Mode ka demo hai.
 - Ye browser me chalta hai. Iska data aapke browser ke `localStorage` me rehta hai.
 - Isme naya `shared/crypto-secure.ts` module hai. Ye module sahi tareeke se random number banata hai (CSPRNG), SHA-256 hash karta hai, aur demo data ko AES-GCM se encrypt kar sakta hai.
+- Demo ledger ab Home.tsx me password (kam se kam 12 akshar) se encrypt karke save hota hai. Purana plain data ek baar migrate karke delete kar diya jata hai. Password kahin save nahi hota.
+- Isme naya `shared/wallet-secure.ts` module bhi hai: demo wallet banata hai (mnemonic, Ed25519 keypair, `but1` address) aur slow unlock deta hai (~2 minute, brute-force ko mehenga banane ke liye). Mnemonic "BIP39-style" hai, real BIP39 NAHI hai. Slow unlock wallet ko unbreakable NAHI banata — kamzor password phir bhi toot jayega.
 - Ye module demo ko thoda safe banata hai. Par ye demo ko asli wallet nahi banata.
 
 ## 2. Ye demo kya NAHI hai? / What this demo IS NOT

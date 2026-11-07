@@ -25,7 +25,13 @@ Cold Mode सिर्फ स्क्रीन पर विवरण छिप
 
 **नया secure module:** `shared/crypto-secure.ts` में अब सही CSPRNG random, SHA-256 hash, demo keypair और AES-GCM encryption (password से key बनाकर) है। Demo transaction ID अब `Math.random()` की जगह secure random से बनता है।
 
-**साफ़ चेतावनी:** इस module के होने से ये डेमो अब भी असली blockchain या production wallet नहीं बनता। Demo data अभी भी localStorage में plain JSON के रूप में save होता है; encrypt करके save करने के लिए module में `saveEncryptedDemoData()` / `loadEncryptedDemoData()` तैयार हैं, उन्हें Home.tsx से जोड़ना अगला कदम है।
+**साफ़ चेतावनी:** इस module के होने से ये डेमो अब भी असली blockchain या production wallet नहीं बनता।
+
+**नया — encrypted ledger:** Demo balance aur ledger अब Home.tsx में password (कम से कम 12 अक्षर) से AES-GCM encrypt करके save होते हैं। पुराना plain data एक बार migrate करके delete कर दिया जाता है। Password kahin save नहीं होता — bhool gaye to data sirf reset karke milega।
+
+**नया — demo wallet module:** `shared/wallet-secure.ts` में demo wallet banta hai — mnemonic (BIP39-style, real BIP39 नहीं), Ed25519 keypair, `but1` address, aur slow unlock (~2 minute, brute-force ko mehenga banane ke liye)। Slow unlock ka matlab unbreakable नहीं है — kamzor password phir भी टूट जाएगा।
+
+**F-Droid:** F-Droid par launch ke liye checklist dekho — `docs/FDROID-CHECKLIST.md`। Abhi Android app nahi hai aur LICENSE bhi nahi hai, isliye F-Droid launch abhi possible nahi hai। License ka draft hai — `LICENSE-DRAFT-MIT.txt` (sirf draft, Sanjay ke faisle ke baad hi LICENSE banega)।
 
 ## ब्लॉक डेटा का आकार
 
